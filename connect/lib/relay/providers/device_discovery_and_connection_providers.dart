@@ -1,4 +1,4 @@
-import 'package:connect/core/connection_utils/device_connection_data_utils.dart';
+import 'package:connect/network/connection_utils/device_connection_data_utils.dart';
 import 'package:connect/core/device_discovery_and_connection/default_udp_broadcast_and_connecton_service.dart';
 import 'package:connect/core/device_discovery_and_connection/udp_broadcast_service.dart';
 import 'package:connect/core/device_discovery_and_connection/udp_connection_request.dart';

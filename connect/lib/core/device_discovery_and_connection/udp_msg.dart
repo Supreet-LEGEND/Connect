@@ -1,5 +1,5 @@
-import 'package:connect/core/connection_utils/device_communication_msg_utils.dart';
-import 'package:connect/core/connection_utils/device_connection_data_utils.dart';
+import 'package:connect/network/connection_utils/device_communication_msg_utils.dart';
+import 'package:connect/network/connection_utils/device_connection_data_utils.dart';
 
 class SenderMsg {
   final String msgType;

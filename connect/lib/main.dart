@@ -6,10 +6,13 @@ import 'package:connect/relay/providers/hotspot_status_provider.dart';
 import 'package:connect/relay/providers/lifecycle_state_provider.dart';
 import 'package:connect/relay/providers/wifi_status_provider.dart';
 import 'package:connect/view/home_page.dart';
+import 'package:cryptography_flutter/cryptography_flutter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+
 void main() {
+  FlutterCryptography.enable();
   runApp(ProviderScope(child: const App()));
 }
 

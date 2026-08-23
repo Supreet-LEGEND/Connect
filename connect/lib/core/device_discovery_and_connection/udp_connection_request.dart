@@ -1,6 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
-import 'package:connect/core/connection_utils/device_communication_msg_utils.dart';
+import 'package:connect/network/connection_utils/device_communication_msg_utils.dart';
 import 'package:connect/core/device_discovery_and_connection/udp_msg.dart';
 
 class ConnectionManager {
