@@ -1,4 +1,4 @@
-import 'package:connect/network/transfer/send_transfer.dart';
+import 'package:connect/network/transfer/transfer.dart';
 
 class TransferChunk {
   final Transfer transfer;

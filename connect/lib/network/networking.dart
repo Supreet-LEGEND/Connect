@@ -6,6 +6,4 @@ export 'connection/connection_pool.dart';
 export 'connection/device_session.dart';
 export 'transfer/transfer.dart';
 export 'transfer/transfer_job.dart';
-export 'transfer/send_transfer.dart';
-export 'transfer/receive_transfer.dart';
 export 'transfer/transfer_manager.dart';

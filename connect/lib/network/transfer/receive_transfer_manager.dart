@@ -1,18 +1,61 @@
+import 'dart:async';
 import 'dart:io';
 
-import 'package:connect/network/transfer/receive_transfer.dart';
+import 'package:connect/network/connection/incoming_connection.dart';
+import 'package:connect/network/transfer/transfer.dart';
+import 'package:connect/network/transfer/transfer_manager.dart';
 
-class ReceiveTransferManager {
+/// Manages incoming file transfers from remote devices
+/// 
+/// Tracks received transfers and coordinates with bounded queue.
+/// Sends size information to sender for backpressure feedback.
+class ReceiveTransferManager extends BaseTransferManager {
   final Directory directory;
 
-  final Map<String, ReceivingTransfer>
-      _transfers = {};
+  /// Track bytes received per transfer for backpressure feedback
+  final Map<String, int> _bytesReceivedPerTransfer = {};
 
   ReceiveTransferManager({
     required this.directory,
   });
 
-  Future<void> handle({
+  @override
+  Future<void> registerDevice(DeviceSession device) async {
+    // Receive side doesn't need per-device queues
+    // But could track device-level statistics here
+  }
+
+  /// Register an incoming connection and start listening to its frames
+  /// 
+  /// This method should be called when a new connection is accepted.
+  /// It subscribes to the connection's frame stream and processes
+  /// all incoming frames for transfer operations.
+  Future<void> registerConnection(
+    IncomingConnection connection,
+  ) async {
+    await connection.start();
+
+    // Subscribe to all frames from this connection
+    connection.frames.listen(
+      (frame) async {
+        await _handleFrame(
+          type: frame['type'] as String,
+          header: frame['header'] as Map<String, dynamic>,
+          payload: frame['payload'] as List<int>,
+          connection: frame['connection'] as IncomingConnection,
+        );
+      },
+      onError: (error) {
+        // TODO: Log error
+      },
+      onDone: () {
+        // Connection closed
+      },
+    );
+  }
+
+  /// Handle a single frame from a connection
+  Future<void> _handleFrame({
     required String type,
     required Map<String, dynamic> header,
     required List<int> payload,
@@ -75,14 +118,18 @@ class ReceiveTransferManager {
     );
 
     final transfer =
-        ReceivingTransfer(
+        ReceivingFileTransfer(
       id: id,
+      deviceId: '', // TODO: Get actual device ID from connection context
       fileName: name,
       fileSize: size,
       file: file,
     );
 
-    _transfers[id] = transfer;
+    transfers[transfer.id] = transfer;
+    _bytesReceivedPerTransfer[id] = 0;
+    transfer.status = TransferStatus.transferring;
+    emitUpdate(transfer);
   }
 
   Future<void> _handleChunk(
@@ -103,7 +150,7 @@ class ReceiveTransferManager {
         header['length'] as int;
 
     final transfer =
-        _transfers[id];
+        transfers[id] as ReceivingFileTransfer?;
 
     if (transfer == null) {
       throw StateError(
@@ -145,6 +192,11 @@ class ReceiveTransferManager {
     transfer.receivedChunks
         .add(chunkIndex);
 
+    // Track bytes received for backpressure feedback
+    _bytesReceivedPerTransfer[id] = (_bytesReceivedPerTransfer[id] ?? 0) + length;
+
+    emitUpdate(transfer);
+
     await connection.sendAck(
       transferId: id,
       chunkIndex: chunkIndex,
@@ -158,7 +210,7 @@ class ReceiveTransferManager {
         header['transferId'] as String;
 
     final transfer =
-        _transfers.remove(id);
+        transfers.remove(id) as ReceivingFileTransfer?;
 
     if (transfer == null) {
       return;
@@ -166,6 +218,11 @@ class ReceiveTransferManager {
 
     await transfer.file.flush();
     await transfer.file.close();
+
+    _bytesReceivedPerTransfer.remove(id);
+
+    transfer.status = TransferStatus.completed;
+    emitUpdate(transfer);
 
     // TODO:
     // SHA-256 the .part file.
@@ -181,15 +238,21 @@ class ReceiveTransferManager {
         header['transferId'] as String;
 
     final transfer =
-        _transfers.remove(id);
+        transfers.remove(id) as ReceivingFileTransfer?;
 
     await transfer?.file.close();
+    _bytesReceivedPerTransfer.remove(id);
+
+    if (transfer != null) {
+      transfer.status = TransferStatus.cancelled;
+      emitUpdate(transfer);
+    }
   }
 
   Future<void> _handleMessage(
     Map<String, dynamic> header,
     List<int> payload,
   ) async {
-    // Decode/process your message here.
+    // Decode/process message here.
   }
 }
