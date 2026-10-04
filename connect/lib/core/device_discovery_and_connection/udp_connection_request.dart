@@ -3,13 +3,13 @@ import 'dart:io';
 import 'package:connect/network/connection_utils/device_communication_msg_utils.dart';
 import 'package:connect/core/device_discovery_and_connection/udp_msg.dart';
 
-class ConnectionManager {
+class UdpConnectionSignaler {
   // vars
   final int port;
   final String deviceIp;
   final String deviceName;
 
-  ConnectionManager({
+  UdpConnectionSignaler({
     required this.port,
     required this.deviceIp,
     required this.deviceName,

@@ -1,85 +1,94 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'secure_channel.dart';
+import 'connection_health.dart';
 import '../crypto/crypto_service.dart';
-import '../protocol/frame.dart';
-import '../protocol/frame_parser.dart';
+import '../crypto/device_identity.dart';
+import '../crypto/trust_store.dart';
+import 'package:cryptography/cryptography.dart';
 
 /// Manages an incoming connection from a remote device
 ///
 /// This class handles:
 /// - Receiving raw bytes from the socket
 /// - Parsing them into frames
+/// - Performing handshake as responder
 /// - Decrypting encrypted frames
 /// - Emitting decrypted frames for higher-level handlers
 ///
 /// This is a generic connection handler with no coupling to transfer logic.
 /// Higher-level managers (like ReceiveTransferManager) subscribe to the
 /// frames stream and handle the actual business logic.
-class IncomingConnection {
+class IncomingConnection implements HeartbeatCapable {
   final Socket socket;
-  final CryptoService crypto;
+  final DeviceIdentity identity;
+  final TrustStore trustStore;
+  final TrustPolicy trustPolicy;
 
-  final FrameParser _parser = FrameParser();
+  SecureChannel? _channel;
 
   /// Stream of decrypted frames: {type, header, payload, connection}
   final StreamController<Map<String, dynamic>> _decryptedFrames =
       StreamController<Map<String, dynamic>>.broadcast();
 
-  StreamSubscription? _subscription;
+  bool _closed = false;
 
   IncomingConnection({
     required this.socket,
-    required this.crypto,
+    required this.identity,
+    required this.trustStore,
+    this.trustPolicy = TrustPolicy.tofu,
   });
+
+  CryptoService? get crypto => _channel?.crypto;
+
+  SimplePublicKey? get peerIdentityPublicKey => _channel?.peerIdentityPublicKey;
+
+  SimplePublicKey? get peerEphemeralPublicKey => _channel?.peerEphemeralPublicKey;
+
+  List<int>? get transcriptHash => _channel?.transcriptHash;
+
+  SecureChannel? get channel => _channel;
 
   /// Stream of decrypted frames ready for processing
   Stream<Map<String, dynamic>> get frames => _decryptedFrames.stream;
 
-  /// Start listening to the socket and emitting frames
-  Future<void> start() async {
-    _subscription = socket.listen(
-      (bytes) {
-        _parser.add(bytes);
+  /// Perform handshake as responder (incoming connection) and start frame processing
+  Future<void> performHandshake() async {
+    if (isHandshakeComplete) {
+      return;
+    }
+
+    _channel = SecureChannel(
+      socket: socket,
+      identity: identity,
+      isInitiator: false,
+      trustStore: trustStore,
+      trustPolicy: trustPolicy,
+    );
+
+    await _channel!.performHandshake();
+    _channel!.startFrameProcessing();
+
+    // Forward decrypted frames with metadata
+    _channel!.frames.listen(
+      (frame) {
+        final type = frame.header['type'] as String?;
+        if (type == 'heartbeat_ping' || type == 'heartbeat_pong') {
+          return; // Already handled by SecureChannel
+        }
+        _decryptedFrames.add({
+          'type': type,
+          'header': frame.header,
+          'payload': frame.payload,
+          'connection': this,
+        });
       },
       onError: (_) {
-        close();
-      },
-      onDone: () {
-        close();
+        // SecureChannel handles errors by closing
       },
     );
-
-    _parser.frames.listen(
-      _handleFrame,
-    );
-  }
-
-  /// Handle a parsed frame by decrypting and emitting
-  Future<void> _handleFrame(ParsedFrame frame) async {
-    final type = frame.header['type'];
-
-    final nonce = List<int>.from(
-      frame.header['nonce'],
-    );
-
-    final mac = List<int>.from(
-      frame.header['mac'],
-    );
-
-    final plaintext = await crypto.decrypt(
-      cipherText: frame.payload,
-      nonce: nonce,
-      mac: mac,
-    );
-
-    // Emit decrypted frame with metadata
-    _decryptedFrames.add({
-      'type': type,
-      'header': frame.header,
-      'payload': plaintext,
-      'connection': this,
-    });
   }
 
   /// Send a frame response (e.g., acknowledgment)
@@ -88,21 +97,15 @@ class IncomingConnection {
     required Map<String, dynamic> header,
     required List<int> payload,
   }) async {
-    final encrypted = await crypto.encrypt(payload);
+    if (!isHandshakeComplete || _channel == null) {
+      throw StateError('Handshake not complete');
+    }
 
-    final frame = Frame(
-      header: {
-        ...header,
-        'type': type,
-        'nonce': encrypted.nonce,
-        'mac': encrypted.mac,
-        'payloadLength': encrypted.cipherText.length,
-      },
-      payload: encrypted.cipherText,
+    await _channel!.sendFrame(
+      type: type,
+      header: header,
+      payload: payload,
     );
-
-    socket.add(frame.encode());
-    await socket.flush();
   }
 
   /// Convenience method for sending chunk acknowledgments
@@ -121,11 +124,53 @@ class IncomingConnection {
     );
   }
 
+  /// Send heartbeat pong
+  Future<void> sendHeartbeatPong() async {
+    await sendFrame(
+      type: 'heartbeat_pong',
+      header: {
+        'version': 1,
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+      },
+      payload: const [],
+    );
+  }
+
+  /// Send a control frame (empty payload)
+  Future<void> sendControl({
+    required String type,
+    required Map<String, dynamic> metadata,
+  }) async {
+    await sendFrame(
+      type: type,
+      header: metadata,
+      payload: const [],
+    );
+  }
+
+  // HeartbeatCapable implementation
+  @override
+  bool get isConnected => _channel != null && !_closed && _channel!.isHandshakeComplete;
+
+  @override
+  bool get isHandshakeComplete => _channel?.isHandshakeComplete ?? false;
+
+  @override
+  Future<void> sendHeartbeat() async {
+    await sendControl(
+      type: 'heartbeat_ping',
+      metadata: {
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+      },
+    );
+  }
+
   /// Close the connection and clean up resources
   Future<void> close() async {
-    await _subscription?.cancel();
-    await socket.close();
+    if (_closed) return;
+    _closed = true;
+    await _channel?.close();
+    _channel = null;
     await _decryptedFrames.close();
-    await _parser.dispose();
   }
 }

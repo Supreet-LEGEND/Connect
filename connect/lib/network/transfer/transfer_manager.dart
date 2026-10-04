@@ -1,89 +1,20 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' show min;
+import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart';
 import 'package:connect/network/connection/device_session.dart';
-import 'package:connect/network/connection_utils/async_semaphore.dart';
 import 'package:connect/network/transfer/transfer.dart';
+import 'package:connect/network/transfer/transfer_job.dart';
+import 'package:connect/network/transfer/transfer_scheduler.dart';
+import 'package:connect/network/protocol/frame_parser.dart';
+import 'package:connect/app/tcp_config.dart';
 
 import '../connection/connection_manager.dart';
 
-/// Bounded queue for managing frame transmission with backpressure
-/// 
-/// Uses fixed-size window (10MB default) to control memory and implement backpressure.
-/// When window is full, sender must wait for ACKs before sending more frames.
-class BoundedFrameQueue {
-  /// Maximum bytes allowed in flight (not yet ACK'd)
-  /// 10MB is standard for most networks
-  final int maxBytesInFlight;
-
-  /// Current bytes in flight
-  int _bytesInFlight = 0;
-
-  /// Completer that resolves when space becomes available
-  Completer<void>? _waitingCompleter;
-
-  BoundedFrameQueue({this.maxBytesInFlight = 10 * 1024 * 1024});
-
-  /// Check if we can send frameSize bytes
-  /// Returns true if within budget, false if need to wait
-  bool canSend(int frameSize) {
-    return _bytesInFlight + frameSize <= maxBytesInFlight;
-  }
-
-  /// Wait until there's space to send frameSize bytes
-  /// Throws error if already waiting
-  Future<void> waitForSpace(int frameSize) async {
-    if (canSend(frameSize)) {
-      return; // Already have space
-    }
-
-    if (_waitingCompleter != null && !_waitingCompleter!.isCompleted) {
-      throw StateError('Already waiting for space');
-    }
-
-    _waitingCompleter = Completer<void>();
-    await _waitingCompleter!.future;
-  }
-
-  /// Record that frameSize bytes were sent
-  /// Must be called when frame is actually transmitted
-  void recordSent(int frameSize) {
-    _bytesInFlight += frameSize;
-  }
-
-  /// Record that frameSize bytes were ACK'd
-  /// Signals any waiters that space is available
-  void recordAck(int frameSize) {
-    _bytesInFlight -= frameSize;
-
-    if (_waitingCompleter != null && !_waitingCompleter!.isCompleted) {
-      _waitingCompleter!.complete();
-      _waitingCompleter = null;
-    }
-  }
-
-  /// Get current window usage as percentage
-  double getUsagePercent() {
-    return (_bytesInFlight / maxBytesInFlight) * 100;
-  }
-
-  /// Get remaining space in bytes
-  int getRemainingBytes() {
-    return maxBytesInFlight - _bytesInFlight;
-  }
-
-  /// Reset the queue (used on transfer completion/error)
-  void reset() {
-    _bytesInFlight = 0;
-    if (_waitingCompleter != null && !_waitingCompleter!.isCompleted) {
-      _waitingCompleter!.complete();
-    }
-    _waitingCompleter = null;
-  }
-}
-
 /// Abstract base class for all transfer management
-/// 
+///
 /// Provides common interface for both sending and receiving transfers.
 /// Subclasses implement specific strategies for each direction.
 abstract class BaseTransferManager {
@@ -99,7 +30,7 @@ abstract class BaseTransferManager {
 
   /// Register a device/connection for this manager
   /// Implementation varies: send tracks devices, receive tracks connections
-  Future<void> registerDevice(DeviceSession device);
+  Future<void> registerDevice(DeviceSession device, {Directory? progressDir});
 
   /// Emit a transfer update to listeners
   void emitUpdate(Transfer transfer) {
@@ -119,38 +50,87 @@ abstract class BaseTransferManager {
 }
 
 /// Manages outgoing file transfers to remote devices
-/// 
-/// Implements bounded queue with backpressure to control:
-/// - Memory usage (max 10MB in flight)
-/// - Network congestion (waits for ACKs before sending more)
-/// - Quality of service (prioritizes messages over files)
+///
+/// Uses TransferScheduler for priority-based scheduling, rate limiting, and retry logic.
+/// Implements striped multi-socket transfers with ACK-based flow control.
 class SendTransferManager extends BaseTransferManager {
   final ConnectionManager connectionManager;
-
-  /// Bounded frame queue for each device (per-device backpressure)
-  final Map<String, BoundedFrameQueue> _deviceQueues = {};
+  final Database _db;
 
   /// Map of device ID to transfer scheduler
-  /// TODO: Implement TransferScheduler when transfer_scheduler.dart is enabled
-  final Map<String, dynamic> _schedulers = {};
+  final Map<String, TransferScheduler> _schedulers = {};
+
+  /// Pending file_start_ack waiters
+  final Map<String, Completer<void>> _fileStartAckWaiters = {};
+
+  /// Track completed chunks per transfer for resume
+  final Map<String, Set<int>> _acknowledgedChunks = {};
 
   SendTransferManager({
     required this.connectionManager,
-  });
+    required Database db,
+  }) : _db = db;
 
   @override
-  Future<void> registerDevice(DeviceSession device) async {
-    // Create bounded queue for this device
-    _deviceQueues[device.deviceId] = BoundedFrameQueue();
+  Future<void> registerDevice(DeviceSession device, {Directory? progressDir}) async {
+    _schedulers[device.deviceId] = TransferScheduler(
+      pool: device.pool,
+      config: const SchedulerConfig(
+        maxRetries: 3,
+        chunkTimeout: Duration(seconds: 30),
+        enableBandwidthThrottling: true,
+      ),
+      onTransferProgress: (transfer) {
+        emitUpdate(transfer);
+      },
+      onTransferCompleted: (transferId) {
+        _onTransferCompleted(device.deviceId, transferId);
+      },
+    );
+    await _schedulers[device.deviceId]!.start();
 
-    // TODO: Initialize scheduler for this device when TransferScheduler is ready
-    _schedulers[device.deviceId] = null;
+    // Listen for incoming acks on all connections
+    for (final connection in device.pool.connections) {
+      connection.frames.listen((frame) {
+        _handleIncomingFrame(frame, connection.id);
+      });
+    }
   }
 
-  /// Send a file to a device with backpressure
-  /// 
+  /// Handle transfer completion (all chunks ACK'd)
+  Future<void> _onTransferCompleted(String deviceId, String transferId) async {
+    final device = connectionManager.get(deviceId);
+    if (device == null) return;
+
+    // Send file_end on all connections
+    for (final connection in device.pool.connections) {
+      try {
+        await connection.sendControl(
+          type: 'file_end',
+          metadata: {
+            'transferId': transferId,
+          },
+        );
+      } catch (e) {
+        debugPrint('Failed to send file_end on ${connection.id}: $e');
+      }
+    }
+
+    // Update transfer status
+    final transfer = transfers[transferId];
+    if (transfer != null) {
+      transfer.status = TransferStatus.completed;
+      emitUpdate(transfer);
+    }
+
+    // Delete progress file on completion
+    await _deleteOutgoingProgress(transferId);
+  }
+
+  /// Send a file to a device
+  ///
   /// Returns immediately but transfers asynchronously.
-  /// Respects bounded queue - will pause if window is full.
+  /// Uses TransferScheduler for priority queuing, rate limiting, and retries.
   Future<Transfer> sendFile({
     required String deviceId,
     required File file,
@@ -161,8 +141,8 @@ class SendTransferManager extends BaseTransferManager {
       throw StateError('Device not connected');
     }
 
-    final queue = _deviceQueues[deviceId];
-    if (queue == null) {
+    final scheduler = _schedulers[deviceId];
+    if (scheduler == null) {
       throw StateError('Device not registered');
     }
 
@@ -181,104 +161,191 @@ class SendTransferManager extends BaseTransferManager {
     transfer.status = TransferStatus.transferring;
     emitUpdate(transfer);
 
-    // Send file_start message
-    await device.pool.connections.first.sendControl(
-      type: 'file_start',
-      metadata: {
-        'transferId': transfer.id,
-        'fileName': transfer.fileName,
-        'fileSize': transfer.totalBytes,
-      },
-    );
+    // Send file_start on ALL connections and wait for acks
+    final ackCompleter = Completer<void>();
+    _fileStartAckWaiters[transfer.id] = ackCompleter;
 
-    // Start producing chunks with backpressure
-    await _produceChunksWithBackpressure(
-      file: file,
-      transfer: transfer,
-      queue: queue,
-      device: device,
-    );
+    for (final connection in device.pool.connections) {
+      try {
+        await connection.sendControl(
+          type: 'file_start',
+          metadata: {
+            'transferId': transfer.id,
+            'fileName': transfer.fileName,
+            'fileSize': transfer.totalBytes,
+            'totalChunks': (size / BaseTcpConfig.fileChunkSize).ceil(),
+          },
+        );
+      } catch (e) {
+        debugPrint('Failed to send file_start on ${connection.id}: $e');
+      }
+    }
+
+    // Wait for file_start_ack from all connections (with timeout)
+    try {
+      await ackCompleter.future.timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      debugPrint('Timeout waiting for file_start_ack for transfer ${transfer.id}');
+    } finally {
+      _fileStartAckWaiters.remove(transfer.id);
+    }
+
+    // Enqueue all chunks into the scheduler
+    await _enqueueChunks(file, transfer, scheduler, device);
 
     return transfer;
   }
 
-  /// Produce and send file chunks while respecting bounded queue backpressure
-  Future<void> _produceChunksWithBackpressure({
-    required File file,
-    required FileTransfer transfer,
-    required BoundedFrameQueue queue,
-    required DeviceSession device,
-  }) async {
-    const chunkSize = 1024 * 1024; // 1MB chunks
-    final fileSize = await file.length();
+  /// Handle file_start_ack from receiver
+  void handleFileStartAck(String transferId, String connectionId, {List<int> completedChunks = const []}) {
+    final completer = _fileStartAckWaiters[transferId];
+    if (completer != null && !completer.isCompleted) {
+      // For simplicity, we just complete on first ack.
+      // In a more robust implementation, we'd track acks per connection.
+      completer.complete();
+    }
+    
+    // Store acknowledged chunks for resume
+    if (completedChunks.isNotEmpty) {
+      _acknowledgedChunks[transferId] = completedChunks.toSet();
+    }
+  }
+
+  /// Read file and enqueue all chunks into the scheduler
+  Future<void> _enqueueChunks(
+    File file,
+    FileTransfer transfer,
+    TransferScheduler scheduler,
+    DeviceSession device,
+  ) async {
+    const chunkSize = BaseTcpConfig.fileChunkSize;
     final raf = await file.open(mode: FileMode.read);
 
     try {
       int offset = 0;
       int chunkIndex = 0;
+      final fileSize = await file.length();
+
+      // Get already acknowledged chunks for resume
+      final acknowledgedChunks = _acknowledgedChunks[transfer.id] ?? {};
 
       while (offset < fileSize) {
         final length = min(chunkSize, fileSize - offset);
-
-        // BACKPRESSURE: Wait if queue is full
-        // This naturally slows down reading to match network speed
-        await queue.waitForSpace(length);
+        
+        // Skip already acknowledged chunks
+        if (acknowledgedChunks.contains(chunkIndex)) {
+          debugPrint('Skipping already acknowledged chunk $chunkIndex for transfer ${transfer.id}');
+          offset += length;
+          chunkIndex++;
+          continue;
+        }
 
         await raf.setPosition(offset);
         final bytes = await raf.read(length);
 
-        // TODO: Integrate with scheduler when TransferScheduler is ready
-        // final chunk = TransferChunk(
-        //   transfer: transfer,
-        //   chunkIndex: chunkIndex,
-        //   offset: offset,
-        //   data: bytes,
-        // );
-        // scheduler.add(chunk);
+        final chunk = TransferChunk(
+          transfer: transfer,
+          chunkIndex: chunkIndex,
+          offset: offset,
+          data: bytes,
+        );
 
-        // Record bytes sent and update queue
-        queue.recordSent(length);
-        transfer.transferredBytes += length;
-        emitUpdate(transfer);
-
-        // TODO: Send chunk through connection
-        // await device.pool.connections.first.send(
-        //   type: 'file_chunk',
-        //   metadata: {...},
-        //   payload: bytes,
-        // );
+        // Scheduler handles priority, rate limiting, retry, and actual sending
+        scheduler.addChunk(chunk, priority: SchedulerPriority.file);
 
         offset += bytes.length;
         chunkIndex++;
       }
-
-      // Send file_end message
-      await device.pool.connections.first.sendControl(
-        type: 'file_end',
-        metadata: {
-          'transferId': transfer.id,
-          'fileName': transfer.fileName,
-        },
-      );
-
-      transfer.status = TransferStatus.completed;
-      emitUpdate(transfer);
     } finally {
       await raf.close();
-      queue.reset(); // Clean up for next transfer
     }
+  }
+  void _handleIncomingFrame(ParsedFrame frame, String connectionId) {
+    final type = frame.header['type'] as String?;
+    if (type == null) return;
+
+    switch (type) {
+      case 'file_start_ack':
+        _handleFileStartAck(frame, connectionId);
+        break;
+      case 'chunk_ack':
+        _handleChunkAck(frame);
+        break;
+      case 'file_end_ack':
+        // Handle file end ack if needed
+        break;
+    }
+  }
+
+  /// Handle file_start_ack from receiver
+  void _handleFileStartAck(ParsedFrame frame, String connectionId) {
+    final transferId = frame.header['transferId'] as String?;
+    final completedChunks = (frame.header['completedChunks'] as List<dynamic>?)?.map((e) => e as int).toList() ?? [];
+    
+    if (transferId != null) {
+      handleFileStartAck(transferId, connectionId, completedChunks: completedChunks);
+    }
+  }
+
+  /// Handle chunk_ack from receiver
+  void _handleChunkAck(ParsedFrame frame) {
+    final transferId = frame.header['transferId'] as String?;
+    final chunkIndex = frame.header['chunkIndex'] as int?;
+    
+    if (transferId != null && chunkIndex != null) {
+      TransferScheduler? scheduler;
+      for (final s in _schedulers.values) {
+        if (s.getChunk('${transferId}_$chunkIndex') != null) {
+          scheduler = s;
+          break;
+        }
+      }
+      if (scheduler != null) {
+        scheduler.recordChunkAck('${transferId}_$chunkIndex');
+        // Save progress after each chunk is acknowledged
+        final transfer = transfers[transferId];
+        if (transfer is FileTransfer) {
+          _saveOutgoingProgress(transferId, transfer);
+        }
+      }
+    }
+  }
+
+  /// Save outgoing transfer progress to SQLite
+  Future<void> _saveOutgoingProgress(String transferId, FileTransfer transfer) async {
+    try {
+      final data = {
+        'transferId': transfer.id,
+        'deviceId': transfer.deviceId,
+        'fileName': transfer.fileName,
+        'filePath': transfer.filePath,
+        'totalBytes': transfer.totalBytes,
+        'acknowledgedChunks': _acknowledgedChunks[transferId]?.toList() ?? [],
+        'lastUpdated': DateTime.now().toIso8601String(),
+      };
+      await _db.insert('outgoing_progress', {
+        'transfer_id': transfer.id,
+        'device_id': transfer.deviceId,
+        'file_name': transfer.fileName,
+        'file_path': transfer.filePath,
+        'total_bytes': transfer.totalBytes,
+        'acknowledged_chunks': jsonEncode(_acknowledgedChunks[transferId]?.toList() ?? []),
+        'last_updated': DateTime.now().toIso8601String(),
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+    } catch (e) {
+      debugPrint('Failed to save outgoing progress for $transferId: $e');
+    }
+  }
+
+  /// Delete outgoing progress file on completion
+  Future<void> _deleteOutgoingProgress(String transferId) async {
+    await _db.delete('outgoing_progress', where: 'transfer_id = ?', whereArgs: [transferId]);
   }
 
   @override
   Future<void> dispose() async {
-    for (final queue in _deviceQueues.values) {
-      queue.reset();
-    }
     for (final scheduler in _schedulers.values) {
-      if (scheduler != null) {
-        // TODO: Call stop() when TransferScheduler is implemented
-        // await scheduler.stop();
-      }
+      await scheduler.dispose();
     }
     await super.dispose();
   }

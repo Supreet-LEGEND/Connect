@@ -5,55 +5,84 @@ import 'package:connect/core/device_discovery_and_connection/udp_connection_requ
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
-final udpServiceFutureProvider = FutureProvider.autoDispose<UdpDiscoveryService?>((
-  ref,
-) async {
+// UDP Service - using FutureProvider for lifecycle
+final udpDiscoveryServiceProvider = FutureProvider<UdpDiscoveryService?>((ref) async {
   return await DefaultUdpBroadcastAndConnectionService.getDefaultUdpDiscoveryService();
 });
 
-// final udpServiceProvider = StateProvider.autoDispose<UdpDiscoveryService?>((
-//   ref,
-// ) {
-//   return null;
-// });
+// UDP Service Future Provider
+final udpServiceFutureProvider = FutureProvider<UdpDiscoveryService?>((ref) async {
+  return await DefaultUdpBroadcastAndConnectionService.getDefaultUdpDiscoveryService();
+});
 
-final connectionManagerFutureProvider =
-    FutureProvider.autoDispose<ConnectionManager>((ref) async {
-      return await DefaultUdpBroadcastAndConnectionService.getDefaultConnectionManager();
+// Connection Signaler
+final connectionSignalerFutureProvider = FutureProvider<UdpConnectionSignaler>((ref) async {
+  return await DefaultUdpBroadcastAndConnectionService.getDefaultConnectionSignaler();
+});
+
+// Discovery State
+final isDiscoveringProvider = StateProvider<bool>((ref) => false);
+final isDiscoveredProvider = StateProvider<bool>((ref) => false);
+
+// Available Devices - using StateProvider for simplicity
+final availableDevicesProvider = StateProvider.autoDispose<Map<String, DeviceConnectionInfo>>((ref) => {});
+
+// Connected Devices - persistent, not autoDispose
+final connectedDevicesProvider = StateProvider<Map<String, DeviceConnectionInfo>>((ref) => {});
+
+// Callback providers
+final onConnectionRequestProvider = StateProvider<String?>((ref) => null);
+final onConnectionAcceptedProvider = StateProvider<String?>((ref) => null);
+final onConnectionDeniedProvider = StateProvider<String?>((ref) => null);
+final onDevicesUpdatedProvider = StateProvider.autoDispose<Map<String, DeviceConnectionInfo>>((ref) => {});
+
+// Controller providers for UI actions
+class DiscoveryController {
+  final Ref ref;
+  DiscoveryController(this.ref);
+
+  Future<void> startDiscovery() async {
+    final service = await ref.read(udpDiscoveryServiceProvider.future);
+    if (service != null) {
+      await service.start();
+      ref.read(isDiscoveringProvider.notifier).state = true;
+    }
+  }
+
+  Future<void> stopDiscovery() async {
+    final service = await ref.read(udpDiscoveryServiceProvider.future);
+    if (service != null) {
+      service.stopBroadcast();
+      ref.read(isDiscoveringProvider.notifier).state = false;
+    }
+  }
+
+  void onConnectionRequest(String ip) {
+    ref.read(onConnectionRequestProvider.notifier).state = ip;
+  }
+
+  void onConnectionAccepted(String ip) {
+    ref.read(onConnectionAcceptedProvider.notifier).state = ip;
+  }
+
+  void onConnectionDenied(String ip) {
+    ref.read(onConnectionDeniedProvider.notifier).state = ip;
+  }
+
+  void onDevicesUpdated(Map<String, DeviceConnectionInfo> devices) {
+    ref.read(availableDevicesProvider.notifier).state = Map.from(devices);
+    if (devices.isNotEmpty) {
+      ref.read(isDiscoveredProvider.notifier).state = true;
+    }
+  }
+
+  void onDisconnect(String ip) {
+    ref.read(connectedDevicesProvider.notifier).update((state) {
+      final newState = Map<String, DeviceConnectionInfo>.from(state);
+      newState.remove(ip);
+      return newState;
     });
+  }
+}
 
-final isDiscoveringProvider = StateProvider.autoDispose<bool>((ref) {
-  return false;
-});
-
-final isDiscoveredProvider = StateProvider.autoDispose<bool>((ref) {
-  return false;
-});
-
-final availableDevicesProvider =
-    StateProvider.autoDispose<Map<String, DeviceConnectionInfo>>((ref) {
-      return {};
-    });
-
-final connectedDevicesProvider =
-    StateProvider.autoDispose<Map<String, DeviceConnectionInfo>>((ref) {
-      return {};
-    });
-
-// callbacks providers
-final onConnectionRequestProvider = StateProvider.autoDispose<String?>((ref) {
-  return null;
-});
-
-final onConnectionAcceptedProvider = StateProvider.autoDispose<String?>((ref) {
-  return null;
-});
-
-final onConnectionDeniedProvider = StateProvider.autoDispose<String?>((ref) {
-  return null;
-});
-
-final onDevicesUpdatedProvider =
-    StateProvider.autoDispose<Map<String, DeviceConnectionInfo>>((ref) {
-      return {};
-    });
+final discoveryControllerProvider = Provider<DiscoveryController>((ref) => DiscoveryController(ref));

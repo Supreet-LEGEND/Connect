@@ -28,12 +28,12 @@ class DefaultUdpBroadcastAndConnectionService {
     );
   }
 
-  // Returns a ConnectionManager with default parameters (local IP and device name)
-  static Future<ConnectionManager> getDefaultConnectionManager() async {
+  // Returns a UdpConnectionSignaler with default parameters (local IP and device name)
+  static Future<UdpConnectionSignaler> getDefaultConnectionSignaler() async {
     String? ip = await WifiConnectionManager.getLocalIp();
     String deviceName = await DeviceDetailsManager().getDeviceName();
 
-    return ConnectionManager(
+    return UdpConnectionSignaler(
       port: UdpConfig.broadcastPort,
       deviceIp: ip!,
       deviceName: deviceName,

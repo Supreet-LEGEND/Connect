@@ -1,29 +1,25 @@
 import 'dart:async';
 import 'dart:io';
 
-import '../crypto/crypto_service.dart';
-import '../protocol/frame.dart';
+import 'secure_channel.dart';
+import 'connection_health.dart';
+import '../crypto/device_identity.dart';
+import '../crypto/trust_store.dart';
 import '../protocol/frame_parser.dart';
+import 'package:cryptography/cryptography.dart';
 
-class Connection {
-  final String id;
-  final String deviceId;
+class Connection implements HeartbeatCapable {
+  String id;
+  String deviceId;
 
   final String host;
   final int port;
 
-  final CryptoService crypto;
+  final DeviceIdentity identity;
+  final TrustStore trustStore;
+  final TrustPolicy trustPolicy;
 
-  Socket? _socket;
-
-  final FrameParser _parser =
-      FrameParser();
-
-  StreamSubscription? _subscription;
-
-  final StreamController<ParsedFrame>
-      _frames =
-      StreamController<ParsedFrame>.broadcast();
+  SecureChannel? _channel;
 
   bool _busy = false;
   bool _closed = false;
@@ -33,49 +29,79 @@ class Connection {
     required this.deviceId,
     required this.host,
     required this.port,
-    required this.crypto,
+    required this.identity,
+    required this.trustStore,
+    this.trustPolicy = TrustPolicy.tofu,
   });
 
   bool get isBusy => _busy;
 
-  bool get isConnected =>
-      _socket != null &&
-      !_closed;
+  @override
+  bool get isConnected => _channel != null && !_closed && _channel!.isHandshakeComplete;
 
-  Stream<ParsedFrame> get frames =>
-      _frames.stream;
+  @override
+  bool get isHandshakeComplete => _channel?.isHandshakeComplete ?? false;
+
+  SimplePublicKey? get peerIdentityPublicKey => _channel?.peerIdentityPublicKey;
+
+  SimplePublicKey? get peerEphemeralPublicKey => _channel?.peerEphemeralPublicKey;
+
+  List<int>? get transcriptHash => _channel?.transcriptHash;
+
+  SecureChannel? get channel => _channel;
+
+  Stream<ParsedFrame> get frames {
+    if (_channel == null) {
+      return const Stream<ParsedFrame>.empty();
+    }
+    return _channel!.frames;
+  }
 
   Future<void> connect() async {
     if (isConnected) {
       return;
     }
 
-    _socket = await Socket.connect(
+    if (_channel != null) {
+      await _channel!.close();
+    }
+
+    final socket = await Socket.connect(
       host,
       port,
-      timeout:
-          const Duration(seconds: 5),
+      timeout: const Duration(seconds: 5),
     );
 
     _closed = false;
 
-    _subscription =
-        _socket!.listen(
-      (bytes) {
-        _parser.add(bytes);
+    _channel = SecureChannel(
+      socket: socket,
+      identity: identity,
+      isInitiator: true,
+      trustStore: trustStore,
+      trustPolicy: trustPolicy,
+      onHeartbeatPong: () {
+        // Callback set by DeviceSession after connection
       },
-      onError: (_) {
-        _handleDisconnect();
-      },
-      onDone: () {
-        _handleDisconnect();
-      },
-      cancelOnError: false,
     );
 
-    _parser.frames.listen(
-      _frames.add,
-    );
+    await _channel!.performHandshake();
+    _channel!.startFrameProcessing();
+  }
+
+  Future<void> performHandshake({required bool isInitiator}) async {
+    if (isHandshakeComplete) {
+      return;
+    }
+
+    if (_channel == null) {
+      throw StateError('Connection not established');
+    }
+
+    await _channel!.performHandshake();
+    if (isInitiator) {
+      _channel!.startFrameProcessing();
+    }
   }
 
   Future<void> send({
@@ -84,38 +110,20 @@ class Connection {
     required List<int> plaintext,
   }) async {
     if (!isConnected) {
-      throw StateError(
-        'Connection is not connected',
-      );
+      throw StateError('Connection is not connected');
     }
 
     _busy = true;
 
     try {
-      final encrypted =
-          await crypto.encrypt(
-        plaintext,
+      await _channel!.sendFrame(
+        type: type,
+        header: {
+          'version': 1,
+          ...metadata,
+        },
+        payload: plaintext,
       );
-
-      final header = {
-        'version': 1,
-        'type': type,
-        'nonce': encrypted.nonce,
-        'mac': encrypted.mac,
-        'payloadLength':
-            encrypted.cipherText.length,
-        ...metadata,
-      };
-
-      final frame = Frame(
-        header: header,
-        payload:
-            encrypted.cipherText,
-      );
-
-      _socket!.add(frame.encode());
-
-      await _socket!.flush();
     } finally {
       _busy = false;
     }
@@ -132,22 +140,24 @@ class Connection {
     );
   }
 
-  void _handleDisconnect() {
-    _socket = null;
-    _busy = false;
+  @override
+  Future<void> sendHeartbeat() async {
+    await sendControl(
+      type: 'heartbeat_ping',
+      metadata: {
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+      },
+    );
   }
 
   Future<void> close() async {
     _closed = true;
+    await _channel?.close();
+    _channel = null;
+  }
 
-    await _subscription?.cancel();
-
-    await _socket?.flush();
-
-    await _socket?.close();
-
-    await _parser.dispose();
-
-    await _frames.close();
+  void updateDeviceId(String newDeviceId) {
+    deviceId = newDeviceId;
+    id = newDeviceId;
   }
 }

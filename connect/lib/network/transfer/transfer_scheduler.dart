@@ -1,54 +1,31 @@
 import 'dart:async';
 import 'dart:collection';
+import 'package:connect/network/connection/connection.dart';
 import 'package:connect/network/connection/connection_pool.dart';
 import 'package:connect/network/transfer/transfer.dart';
 import 'package:connect/network/transfer/transfer_job.dart';
 
-// ============================================================================
-// ENUMS & STATE MACHINES
-// ============================================================================
-
-/// Priority levels for transfer scheduling
 enum SchedulerPriority {
-  control,  // Highest priority (protocol messages)
-  message,  // Medium priority (user messages)
-  file,     // Lowest priority (large file transfers)
+  control,
+  message,
+  file,
 }
 
-/// State machine for chunk lifecycle
 enum ChunkState {
-  queued,    // Waiting to be sent
-  sending,   // Currently being sent
-  acked,     // Successfully received and ACK'd
-  failed,    // Failed (will retry)
-  deadLetter, // Failed after max retries
+  queued,
+  sending,
+  acked,
+  failed,
+  deadLetter,
 }
 
-// ============================================================================
-// DATA CLASSES
-// ============================================================================
-
-/// Configuration for the transfer scheduler
 class SchedulerConfig {
-  /// Maximum number of retry attempts per chunk
   final int maxRetries;
-
-  /// Maximum bytes per second per device (0 = unlimited)
   final int maxBytesPerSecond;
-
-  /// Maximum chunks per second (0 = unlimited)
   final int maxChunksPerSecond;
-
-  /// Base duration for exponential backoff (100ms default)
   final Duration retryBackoffBase;
-
-  /// Maximum time to wait before chunk timeout (30s default)
   final Duration chunkTimeout;
-
-  /// Maximum concurrent transfers per device
   final int maxConcurrentTransfers;
-
-  /// Whether to enable bandwidth throttling
   final bool enableBandwidthThrottling;
 
   const SchedulerConfig({
@@ -62,11 +39,11 @@ class SchedulerConfig {
   });
 }
 
-/// Wrapper for chunk with scheduling metadata
 class ScheduledChunk {
   final String id;
   final TransferChunk chunk;
   final SchedulerPriority priority;
+  final int connectionIndex;
 
   ChunkState state = ChunkState.queued;
   int retryCount = 0;
@@ -80,22 +57,18 @@ class ScheduledChunk {
     required this.id,
     required this.chunk,
     this.priority = SchedulerPriority.file,
+    required this.connectionIndex,
   });
 
-  /// Duration since this chunk was created
   Duration get age => DateTime.now().difference(createdAt);
 
-  /// Check if chunk has exceeded timeout
   bool isTimedOut(Duration timeout) {
-    return sentAt != null &&
-        DateTime.now().difference(sentAt!) > timeout;
+    return sentAt != null && DateTime.now().difference(sentAt!) > timeout;
   }
 
-  /// Get string representation of state
   String get stateString => state.toString().split('.').last;
 }
 
-/// Statistics for a single connection worker
 class ConnectionStats {
   final String connectionId;
   int chunksProcessed = 0;
@@ -108,29 +81,24 @@ class ConnectionStats {
 
   ConnectionStats({required this.connectionId});
 
-  /// Success rate as percentage (0-100)
   double get successRate {
     if (chunksProcessed == 0) return 0;
     return (successfulChunks / chunksProcessed) * 100;
   }
 
-  /// Calculate throughput in KB/s
   double get throughputKBps {
     final elapsed = DateTime.now().difference(startTime).inMilliseconds;
     if (elapsed == 0) return 0;
     return (totalBytesSent / 1024) / (elapsed / 1000);
   }
 
-  /// Utilization as percentage (0-100)
   double get utilizationPercent {
     final elapsed = DateTime.now().difference(startTime).inMilliseconds;
     if (elapsed == 0) return 0;
-    // Rough estimate based on activity
     return (chunksProcessed / (elapsed / 100)).clamp(0, 100);
   }
 }
 
-/// Overall scheduler statistics
 class SchedulerStats {
   int totalChunksSent = 0;
   int totalChunksFailed = 0;
@@ -141,31 +109,23 @@ class SchedulerStats {
   final DateTime startTime = DateTime.now();
   final Map<String, ConnectionStats> connectionStats = {};
 
-  /// Overall success rate
   double get successRate {
     if (totalChunksSent == 0) return 0;
     return (totalChunksAcked / totalChunksSent) * 100;
   }
 
-  /// Overall throughput in KB/s
   double get averageThroughputKBps {
     final elapsed = DateTime.now().difference(startTime).inMilliseconds;
     if (elapsed == 0) return 0;
     return (totalBytesSent / 1024) / (elapsed / 1000);
   }
 
-  /// Retry rate as percentage
   double get retryRate {
     if (totalChunksSent == 0) return 0;
     return (totalRetries / totalChunksSent) * 100;
   }
 }
 
-// ============================================================================
-// EVENTS FOR MONITORING
-// ============================================================================
-
-/// Base class for scheduler events
 abstract class SchedulerEvent {
   final DateTime timestamp = DateTime.now();
 }
@@ -185,6 +145,11 @@ class ChunkAckedEvent extends SchedulerEvent {
   final String chunkId;
   final Duration latency;
   ChunkAckedEvent(this.chunkId, this.latency);
+}
+
+class TransferCompletedEvent extends SchedulerEvent {
+  final String transferId;
+  TransferCompletedEvent(this.transferId);
 }
 
 class ChunkFailedEvent extends SchedulerEvent {
@@ -223,17 +188,11 @@ class BandwidthThrottledEvent extends SchedulerEvent {
   BandwidthThrottledEvent(this.waitMilliseconds, this.availableBytes);
 }
 
-// ============================================================================
-// PRIORITY QUEUE
-// ============================================================================
-
-/// Queue that orders chunks by priority and creation time
-class BoundedPriorityQueue {
+class _ConnectionQueue {
   final Queue<ScheduledChunk> _controlQueue = Queue();
   final Queue<ScheduledChunk> _messageQueue = Queue();
   final Queue<ScheduledChunk> _fileQueue = Queue();
 
-  /// Add chunk to appropriate priority queue
   void add(ScheduledChunk chunk) {
     switch (chunk.priority) {
       case SchedulerPriority.control:
@@ -248,40 +207,23 @@ class BoundedPriorityQueue {
     }
   }
 
-  /// Remove and return highest priority chunk (or null if empty)
   ScheduledChunk? removeFirst() {
-    if (_controlQueue.isNotEmpty) {
-      return _controlQueue.removeFirst();
-    }
-    if (_messageQueue.isNotEmpty) {
-      return _messageQueue.removeFirst();
-    }
-    if (_fileQueue.isNotEmpty) {
-      return _fileQueue.removeFirst();
-    }
+    if (_controlQueue.isNotEmpty) return _controlQueue.removeFirst();
+    if (_messageQueue.isNotEmpty) return _messageQueue.removeFirst();
+    if (_fileQueue.isNotEmpty) return _fileQueue.removeFirst();
     return null;
   }
 
-  /// Check if queue is empty
-  bool get isEmpty =>
-      _controlQueue.isEmpty &&
-      _messageQueue.isEmpty &&
-      _fileQueue.isEmpty;
+  bool get isEmpty => _controlQueue.isEmpty && _messageQueue.isEmpty && _fileQueue.isEmpty;
 
-  /// Get total chunks across all queues
-  int get length =>
-      _controlQueue.length +
-      _messageQueue.length +
-      _fileQueue.length;
+  int get length => _controlQueue.length + _messageQueue.length + _fileQueue.length;
 
-  /// Clear all queues
   void clear() {
     _controlQueue.clear();
     _messageQueue.clear();
     _fileQueue.clear();
   }
 
-  /// Get queue sizes for monitoring
   Map<String, int> getQueueSizes() {
     return {
       'control': _controlQueue.length,
@@ -291,300 +233,199 @@ class BoundedPriorityQueue {
   }
 }
 
-// ============================================================================
-// MAIN SCHEDULER
-// ============================================================================
-
-/// Production-grade transfer scheduler with load balancing, prioritization, and retry logic
 class TransferScheduler {
   final ConnectionPool pool;
   final SchedulerConfig config;
-
-  /// Priority queue for chunks
-  final BoundedPriorityQueue queue = BoundedPriorityQueue();
-
-  /// Track all scheduled chunks
+  final int numConnections;
+  final List<_ConnectionQueue> _connectionQueues;
   final Map<String, ScheduledChunk> _allChunks = {};
-
-  /// Track paused transfers
+  final Map<String, Map<String, int>> _transferChunkCounts = {};
   final Set<String> _pausedTransfers = {};
-
-  /// Connection statistics
   final Map<String, ConnectionStats> _connectionStats = {};
-
-  /// Global scheduler statistics
   late SchedulerStats stats;
-
-  /// Event stream for monitoring
-  final StreamController<SchedulerEvent> _eventController =
-      StreamController<SchedulerEvent>.broadcast();
-
-  /// Bandwidth tracking
+  final StreamController<SchedulerEvent> _eventController = StreamController<SchedulerEvent>.broadcast();
   DateTime _bandwidthWindowStart = DateTime.now();
   int _bytesInCurrentWindow = 0;
   DateTime _chunkWindowStart = DateTime.now();
   int _chunksInCurrentWindow = 0;
-
-  /// Scheduler state
   bool _running = false;
   final List<Future<void>> _workerFutures = [];
-
-  /// Load balancing state
-  int _lastConnectionIndex = 0;
+  final void Function(Transfer transfer)? onTransferProgress;
+  final void Function(String transferId)? onTransferCompleted;
 
   TransferScheduler({
     required this.pool,
     this.config = const SchedulerConfig(),
-  }) {
+    this.onTransferProgress,
+    this.onTransferCompleted,
+  }) : numConnections = pool.connections.length,
+       _connectionQueues = List.generate(pool.connections.length, (_) => _ConnectionQueue()) {
     stats = SchedulerStats();
     _initializeConnectionStats();
   }
 
-  /// Get event stream
   Stream<SchedulerEvent> get events => _eventController.stream;
 
-  /// Initialize statistics for each connection
   void _initializeConnectionStats() {
     for (int i = 0; i < pool.connections.length; i++) {
       final conn = pool.connections[i];
-      _connectionStats[conn.id] =
-          ConnectionStats(connectionId: conn.id);
+      _connectionStats[conn.id] = ConnectionStats(connectionId: conn.id);
     }
   }
 
-  /// Start the scheduler and worker threads
   Future<void> start() async {
-    if (_running) {
-      return;
-    }
-
+    if (_running) return;
     _running = true;
-
-    // Start a worker for each connection
-    for (final connection in pool.connections) {
-      final workerFuture = _runWorker(connection);
-      _workerFutures.add(workerFuture);
+    for (int i = 0; i < pool.connections.length; i++) {
+      final connection = pool.connections[i];
+      _workerFutures.add(_runWorker(connection, i));
     }
+    _startTimeoutSweep();
   }
 
-  /// Stop the scheduler gracefully
   Future<void> stop() async {
     _running = false;
     await Future.wait(_workerFutures);
-    queue.clear();
+    for (final q in _connectionQueues) q.clear();
   }
 
-  /// Worker thread that processes chunks
-  Future<void> _runWorker(dynamic connection) async {
+  Future<void> _runWorker(Connection connection, int connectionIndex) async {
+    final queue = _connectionQueues[connectionIndex];
     while (_running) {
       try {
-        // Get next chunk (respects priority)
         final scheduledChunk = queue.removeFirst();
-
         if (scheduledChunk == null) {
-          // No chunks, wait a bit
           await Future.delayed(const Duration(milliseconds: 50));
           continue;
         }
-
-        // Check if transfer is paused
-        if (_pausedTransfers
-            .contains(scheduledChunk.chunk.transfer.id)) {
-          // Requeue for later
+        if (scheduledChunk.connectionIndex != connectionIndex) {
+          _connectionQueues[scheduledChunk.connectionIndex].add(scheduledChunk);
+          continue;
+        }
+        if (_pausedTransfers.contains(scheduledChunk.chunk.transfer.id)) {
           queue.add(scheduledChunk);
           await Future.delayed(const Duration(milliseconds: 100));
           continue;
         }
-
-        // Apply rate limiting
         await _applyRateLimit(scheduledChunk.chunk.data.length);
-
-        // Send the chunk
         scheduledChunk.state = ChunkState.sending;
         scheduledChunk.sentAt = DateTime.now();
-
         try {
-          // TODO: Actual send implementation
-          // await connection.send(
-          //   type: 'file_chunk',
-          //   metadata: {
-          //     'transferId': scheduledChunk.chunk.transfer.id,
-          //     'chunkIndex': scheduledChunk.chunk.chunkIndex,
-          //     'offset': scheduledChunk.chunk.offset,
-          //     'length': scheduledChunk.chunk.data.length,
-          //   },
-          //   plaintext: scheduledChunk.chunk.data,
-          // );
-
+          await connection.send(
+            type: 'file_chunk',
+            metadata: {
+              'transferId': scheduledChunk.chunk.transfer.id,
+              'chunkIndex': scheduledChunk.chunk.chunkIndex,
+              'offset': scheduledChunk.chunk.offset,
+              'length': scheduledChunk.chunk.data.length,
+            },
+            plaintext: scheduledChunk.chunk.data,
+          );
           _emitEvent(ChunkSentEvent(scheduledChunk, connection.id));
           _recordChunkSent(scheduledChunk, connection.id);
         } catch (e) {
-          // Handle send error
           await _handleChunkError(scheduledChunk, e);
         }
       } catch (e) {
-        // Log worker error but continue
         print('Scheduler worker error: $e');
         await Future.delayed(const Duration(milliseconds: 500));
       }
     }
   }
 
-  /// Handle chunk send error with retry logic
-  Future<void> _handleChunkError(
-    ScheduledChunk chunk,
-    Object error,
-  ) async {
+  Future<void> _handleChunkError(ScheduledChunk chunk, Object error) async {
     chunk.lastError = error;
     chunk.failedAt = DateTime.now();
     stats.totalChunksFailed++;
-
     if (chunk.retryCount < config.maxRetries) {
-      // Retry with exponential backoff
       await _retryChunk(chunk);
     } else {
-      // Max retries exceeded
       chunk.state = ChunkState.deadLetter;
       stats.totalDeadLetters++;
-      _emitEvent(ChunkFailedEvent(
-        chunk.id,
-        error,
-        chunk.retryCount,
-      ));
+      _emitEvent(ChunkFailedEvent(chunk.id, error, chunk.retryCount));
+      _checkTransferCompletion(chunk.chunk.transfer.id);
     }
   }
 
-  /// Retry a chunk with exponential backoff
   Future<void> _retryChunk(ScheduledChunk chunk) async {
     chunk.retryCount++;
     final backoffDuration = _getBackoffDuration(chunk.retryCount);
-
-    _emitEvent(ChunkRetryEvent(
-      chunk.id,
-      chunk.retryCount,
-      backoffDuration,
-    ));
-
+    _emitEvent(ChunkRetryEvent(chunk.id, chunk.retryCount, backoffDuration));
     stats.totalRetries++;
-
-    // Wait before retrying
     await Future.delayed(backoffDuration);
-
-    // Requeue chunk
     chunk.state = ChunkState.queued;
-    queue.add(chunk);
+    _connectionQueues[chunk.connectionIndex].add(chunk);
   }
 
-  /// Calculate exponential backoff duration
   Duration _getBackoffDuration(int retryCount) {
-    final ms = (config.retryBackoffBase.inMilliseconds *
-            (1 << (retryCount - 1)))
-        .toInt();
-    // Cap at 1 second
+    final ms = (config.retryBackoffBase.inMilliseconds * (1 << (retryCount - 1))).toInt();
     return Duration(milliseconds: ms.clamp(0, 1000));
   }
 
-  /// Apply rate limiting for bandwidth and chunk rate
   Future<void> _applyRateLimit(int byteSize) async {
-    if (!config.enableBandwidthThrottling) {
-      return;
-    }
-
-    // Check bytes per second limit
+    if (!config.enableBandwidthThrottling) return;
     if (config.maxBytesPerSecond > 0) {
       final now = DateTime.now();
       if (now.difference(_bandwidthWindowStart).inSeconds >= 1) {
         _bandwidthWindowStart = now;
         _bytesInCurrentWindow = 0;
       }
-
-      if (_bytesInCurrentWindow + byteSize >
-          config.maxBytesPerSecond) {
+      if (_bytesInCurrentWindow + byteSize > config.maxBytesPerSecond) {
         final waitMs = 100;
-        _emitEvent(BandwidthThrottledEvent(
-          waitMs,
-          config.maxBytesPerSecond - _bytesInCurrentWindow,
-        ));
+        _emitEvent(BandwidthThrottledEvent(waitMs, config.maxBytesPerSecond - _bytesInCurrentWindow));
         await Future.delayed(Duration(milliseconds: waitMs));
       }
-
       _bytesInCurrentWindow += byteSize;
     }
-
-    // Check chunks per second limit
     if (config.maxChunksPerSecond > 0) {
       final now = DateTime.now();
       if (now.difference(_chunkWindowStart).inSeconds >= 1) {
         _chunkWindowStart = now;
         _chunksInCurrentWindow = 0;
       }
-
       if (_chunksInCurrentWindow >= config.maxChunksPerSecond) {
-        await Future.delayed(
-          const Duration(milliseconds: 50),
-        );
+        await Future.delayed(const Duration(milliseconds: 50));
       }
-
       _chunksInCurrentWindow++;
     }
   }
 
-  /// Select least loaded connection for next chunk
-  dynamic _selectLeastLoadedConnection() {
-    if (pool.connections.isEmpty) {
-      throw StateError('No connections available');
-    }
+  void _startTimeoutSweep() {
+    Timer.periodic(const Duration(seconds: 5), (timer) {
+      if (!_running) { timer.cancel(); return; }
+      _checkTimeouts();
+    });
+  }
 
-    dynamic leastLoaded = pool.connections[0];
-    int minChunks = _connectionStats[leastLoaded.id]?.chunksProcessed ?? 0;
-
-    for (final conn in pool.connections) {
-      final stats = _connectionStats[conn.id];
-      final chunks = stats?.chunksProcessed ?? 0;
-      if (chunks < minChunks) {
-        leastLoaded = conn;
-        minChunks = chunks;
+  void _checkTimeouts() {
+    final now = DateTime.now();
+    for (final chunk in _allChunks.values) {
+      if (chunk.state == ChunkState.sending && chunk.sentAt != null && now.difference(chunk.sentAt!) > config.chunkTimeout) {
+        chunk.state = ChunkState.queued;
+        _connectionQueues[chunk.connectionIndex].add(chunk);
+        stats.totalRetries++;
+        _emitEvent(ChunkRetryEvent(chunk.id, chunk.retryCount + 1, Duration.zero));
       }
     }
-
-    return leastLoaded;
   }
 
-  /// Round-robin connection selection
-  dynamic _selectRoundRobinConnection() {
-    if (pool.connections.isEmpty) {
-      throw StateError('No connections available');
-    }
-
-    final conn = pool.connections[_lastConnectionIndex];
-    _lastConnectionIndex =
-        (_lastConnectionIndex + 1) % pool.connections.length;
-    return conn;
-  }
-
-  /// Add chunk to scheduler
-  void addChunk(
-    TransferChunk chunk, {
-    SchedulerPriority priority = SchedulerPriority.file,
-  }) {
+  void addChunk(TransferChunk chunk, {SchedulerPriority priority = SchedulerPriority.file}) {
+    final connectionIndex = chunk.chunkIndex % numConnections;
     final scheduledChunk = ScheduledChunk(
       id: '${chunk.transfer.id}_${chunk.chunkIndex}',
       chunk: chunk,
       priority: priority,
+      connectionIndex: connectionIndex,
     );
-
     _allChunks[scheduledChunk.id] = scheduledChunk;
-    queue.add(scheduledChunk);
+    _connectionQueues[connectionIndex].add(scheduledChunk);
     stats.totalChunksSent++;
-
+    final counts = _transferChunkCounts.putIfAbsent(chunk.transfer.id, () => {'total': 0, 'acked': 0});
+    counts['total'] = counts['total']! + 1;
     _emitEvent(ChunkQueuedEvent(scheduledChunk));
   }
 
-  /// Record successful chunk transmission
-  void _recordChunkSent(
-    ScheduledChunk chunk,
-    String connectionId,
-  ) {
+  void _recordChunkSent(ScheduledChunk chunk, String connectionId) {
     final connStats = _connectionStats[connectionId];
     if (connStats != null) {
       connStats.chunksProcessed++;
@@ -593,95 +434,75 @@ class TransferScheduler {
     }
   }
 
-  /// Mark chunk as ACK'd
   void recordChunkAck(String chunkId) {
     final chunk = _allChunks[chunkId];
     if (chunk == null) return;
-
     chunk.state = ChunkState.acked;
     chunk.ackedAt = DateTime.now();
-
     stats.totalChunksAcked++;
-
     final latency = chunk.ackedAt!.difference(chunk.sentAt!);
     _emitEvent(ChunkAckedEvent(chunkId, latency));
+    for (final connStats in _connectionStats.values) connStats.successfulChunks++;
+    final transfer = chunk.chunk.transfer;
+    if (transfer is FileTransfer) {
+      transfer.transferredBytes += chunk.chunk.data.length;
+      if (onTransferProgress != null) onTransferProgress!(transfer);
+    }
+    _checkTransferCompletion(chunk.chunk.transfer.id);
+  }
 
-    // Update connection stats
-    for (final connStats in _connectionStats.values) {
-      connStats.successfulChunks++;
+  void _checkTransferCompletion(String transferId) {
+    final counts = _transferChunkCounts[transferId];
+    if (counts == null) return;
+    counts['acked'] = counts['acked']! + 1;
+    if (counts['acked']! >= counts['total']!) {
+      _transferChunkCounts.remove(transferId);
+      _emitEvent(TransferCompletedEvent(transferId));
+      if (onTransferCompleted != null) onTransferCompleted!(transferId);
     }
   }
 
-  /// Pause a transfer (doesn't dequeue existing chunks)
   void pauseTransfer(String transferId) {
     _pausedTransfers.add(transferId);
     _emitEvent(TransferPausedEvent(transferId));
   }
 
-  /// Resume a paused transfer
   void resumeTransfer(String transferId) {
     _pausedTransfers.remove(transferId);
     _emitEvent(TransferResumedEvent(transferId));
   }
 
-  /// Cancel a transfer (removes all its chunks)
   void cancelTransfer(String transferId, String reason) {
     _pausedTransfers.remove(transferId);
-
-    // Remove all chunks for this transfer
-    final chunksToRemove = _allChunks.entries
-        .where((e) => e.value.chunk.transfer.id == transferId)
-        .map((e) => e.key)
-        .toList();
-
+    final chunksToRemove = _allChunks.entries.where((e) => e.value.chunk.transfer.id == transferId).map((e) => e.key).toList();
     for (final chunkId in chunksToRemove) {
-      _allChunks.remove(chunkId);
+      final chunk = _allChunks.remove(chunkId);
+      if (chunk != null) chunk.state = ChunkState.deadLetter;
     }
-
+    _transferChunkCounts.remove(transferId);
     _emitEvent(TransferCancelledEvent(transferId, reason));
   }
 
-  /// Get chunk by ID
-  ScheduledChunk? getChunk(String chunkId) {
-    return _allChunks[chunkId];
+  ScheduledChunk? getChunk(String chunkId) => _allChunks[chunkId];
+  List<ScheduledChunk> getQueueStatus() => _allChunks.values.toList();
+  Map<String, Map<String, int>> getQueueSizes() {
+    final result = <String, Map<String, int>>{};
+    for (int i = 0; i < _connectionQueues.length; i++) result['connection_$i'] = _connectionQueues[i].getQueueSizes();
+    return result;
   }
 
-  /// Get current queue status
-  List<ScheduledChunk> getQueueStatus() {
-    return _allChunks.values.toList();
-  }
-
-  /// Get queue sizes by priority
-  Map<String, int> getQueueSizes() {
-    return queue.getQueueSizes();
-  }
-
-  /// Get comprehensive statistics
   SchedulerStats getStatistics() {
     stats.connectionStats.clear();
     stats.connectionStats.addAll(_connectionStats);
     return stats;
   }
 
-  /// Get connection-specific statistics
-  ConnectionStats? getConnectionStats(String connectionId) {
-    return _connectionStats[connectionId];
-  }
+  ConnectionStats? getConnectionStats(String connectionId) => _connectionStats[connectionId];
 
-  /// Set bandwidth limit (0 = unlimited)
-  void setBandwidthLimit(int bytesPerSecond) {
-    // Would need to create a new config or make config mutable
-    // For now, this is a placeholder
-  }
-
-  /// Emit event to listeners
   void _emitEvent(SchedulerEvent event) {
-    if (!_eventController.isClosed) {
-      _eventController.add(event);
-    }
+    if (!_eventController.isClosed) _eventController.add(event);
   }
 
-  /// Clean up resources
   Future<void> dispose() async {
     await stop();
     await _eventController.close();

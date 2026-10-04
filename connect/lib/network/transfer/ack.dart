@@ -3,11 +3,25 @@
 class FileStartAck {
   final String transferId;
   final String fileName;
+  final List<int> completedChunks; // For resume support
 
   const FileStartAck({
     required this.transferId,
     required this.fileName,
+    this.completedChunks = const [],
   });
+
+  Map<String, dynamic> toJson() => {
+    'transferId': transferId,
+    'fileName': fileName,
+    'completedChunks': completedChunks,
+  };
+
+  static FileStartAck fromJson(Map<String, dynamic> json) => FileStartAck(
+    transferId: json['transferId'] as String,
+    fileName: json['fileName'] as String,
+    completedChunks: (json['completedChunks'] as List<dynamic>?)?.map((e) => e as int).toList() ?? [],
+  );
 }
 
 /// Acknowledgment for a received chunk
@@ -20,6 +34,16 @@ class ChunkAck {
     required this.transferId,
     required this.chunkIndex,
   });
+
+  Map<String, dynamic> toJson() => {
+    'transferId': transferId,
+    'chunkIndex': chunkIndex,
+  };
+
+  static ChunkAck fromJson(Map<String, dynamic> json) => ChunkAck(
+    transferId: json['transferId'] as String,
+    chunkIndex: json['chunkIndex'] as int,
+  );
 }
 
 /// Acknowledgment for file transfer completion
@@ -36,6 +60,20 @@ class FileEndAck {
     required this.success,
     this.error,
   });
+
+  Map<String, dynamic> toJson() => {
+    'transferId': transferId,
+    'fileName': fileName,
+    'success': success,
+    'error': error,
+  };
+
+  static FileEndAck fromJson(Map<String, dynamic> json) => FileEndAck(
+    transferId: json['transferId'] as String,
+    fileName: json['fileName'] as String,
+    success: json['success'] as bool,
+    error: json['error'] as String?,
+  );
 }
 
 /// Acknowledgment for transfer cancellation
@@ -48,6 +86,16 @@ class TransferCancelAck {
     required this.transferId,
     required this.reason,
   });
+
+  Map<String, dynamic> toJson() => {
+    'transferId': transferId,
+    'reason': reason,
+  };
+
+  static TransferCancelAck fromJson(Map<String, dynamic> json) => TransferCancelAck(
+    transferId: json['transferId'] as String,
+    reason: json['reason'] as String,
+  );
 }
 
 /// Acknowledgment for message reception
@@ -62,5 +110,42 @@ class MessageAck {
     required this.success,
     this.error,
   });
+
+  Map<String, dynamic> toJson() => {
+    'messageId': messageId,
+    'success': success,
+    'error': error,
+  };
+
+  static MessageAck fromJson(Map<String, dynamic> json) => MessageAck(
+    messageId: json['messageId'] as String,
+    success: json['success'] as bool,
+    error: json['error'] as String?,
+  );
 }
 
+/// Resume request for interrupted transfers
+/// Sent by sender to resume an interrupted transfer
+class TransferResumeRequest {
+  final String transferId;
+  final int resumeFromChunk;
+  final List<int> missingChunks;
+
+  const TransferResumeRequest({
+    required this.transferId,
+    required this.resumeFromChunk,
+    required this.missingChunks,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'transferId': transferId,
+    'resumeFromChunk': resumeFromChunk,
+    'missingChunks': missingChunks,
+  };
+
+  static TransferResumeRequest fromJson(Map<String, dynamic> json) => TransferResumeRequest(
+    transferId: json['transferId'] as String,
+    resumeFromChunk: json['resumeFromChunk'] as int,
+    missingChunks: (json['missingChunks'] as List<dynamic>?)?.map((e) => e as int).toList() ?? [],
+  );
+}

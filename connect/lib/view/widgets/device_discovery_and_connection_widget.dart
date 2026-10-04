@@ -1,10 +1,17 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:crypto/crypto.dart';
+import 'package:connect/app/tcp_config.dart';
 import 'package:connect/network/connection_utils/device_connection_data_utils.dart';
 import 'package:connect/core/device_discovery_and_connection/udp_broadcast_service.dart';
 import 'package:connect/core/device_discovery_and_connection/udp_connection_request.dart';
+import 'package:connect/network/connection/device_session.dart';
 import 'package:connect/relay/providers/device_discovery_and_connection_providers.dart';
+import 'package:connect/relay/providers/transfer_providers.dart';
 import 'package:connect/relay/providers/wifi_status_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:cryptography/cryptography.dart';
 
 class DeviceDiscoveryAndConnectionWidget extends ConsumerStatefulWidget {
   const DeviceDiscoveryAndConnectionWidget({super.key});
@@ -32,8 +39,8 @@ class _DeviceDiscoveryAndConnectionWidgetState
     AsyncValue<UdpDiscoveryService?> udpServiceAsync = ref.watch(
       udpServiceFutureProvider,
     );
-    AsyncValue<ConnectionManager> connectionManagerAsync = ref.watch(
-      connectionManagerFutureProvider,
+    AsyncValue<UdpConnectionSignaler> connectionSignalerAsync = ref.watch(
+      connectionSignalerFutureProvider,
     );
 
     // getting states
@@ -46,6 +53,7 @@ class _DeviceDiscoveryAndConnectionWidgetState
     final connectedDevicesMap = ref.watch(connectedDevicesProvider);
     bool isDiscovering = ref.watch(isDiscoveringProvider);
     bool isDiscovered = ref.watch(isDiscoveredProvider);
+    final controller = ref.watch(discoveryControllerProvider);
 
     return Container(
       padding: const EdgeInsets.all(16.0),
@@ -62,9 +70,6 @@ class _DeviceDiscoveryAndConnectionWidgetState
           }
           return udpServiceAsync.when(
             data: (udpService) {
-              // update udpServiceProvider
-              // ref.read(udpServiceProvider.notifier).state = udpService;
-
               if (udpService == null) {
                 return const Text(
                   "Unable to initialize UDP service. No IP found.",
@@ -74,33 +79,36 @@ class _DeviceDiscoveryAndConnectionWidgetState
               // SET ALL THE CALLBACKS
               // 1. onConnectionRequest
               udpService.onConnectionRequest = (String senderIp) {
-                print("Connection request from $senderIp");
+                debugPrint("Connection request from $senderIp");
+                controller.onConnectionRequest(senderIp);
                 showOnConnectionRequestDialog(
                   context: context,
                   senderIp: senderIp,
                   ref: ref,
                   udpService: udpService,
-                  connectionManagerAsync: connectionManagerAsync,
+                  connectionSignalerAsync: connectionSignalerAsync,
                 );
               };
               // 2. onConnectionAccepted
               udpService.onConnectionAccepted = (String senderIp) {
-                print("Connection accepted from $senderIp");
+                debugPrint("Connection accepted from $senderIp");
+                controller.onConnectionAccepted(senderIp);
                 showOnConnectionAcceptedDialog(
                   context: context,
                   senderIp: senderIp,
                   ref: ref,
                   udpService: udpService,
-                  connectionManagerAsync: connectionManagerAsync,
+                  connectionSignalerAsync: connectionSignalerAsync,
                 );
               };
               // 3. onConnectionDenied
               udpService.onConnectionDenied = (String senderIp) {
-                print("Connection denied from $senderIp");
+                debugPrint("Connection denied from $senderIp");
+                controller.onConnectionDenied(senderIp);
                 showOnConnectionDeniedDialog(
                   context: context,
-                  ref: ref,
                   senderIp: senderIp,
+                  ref: ref,
                 );
               };
               // 4. onDisconnect
@@ -111,28 +119,14 @@ class _DeviceDiscoveryAndConnectionWidgetState
                   ref: ref,
                 );
                 // remove device from connectedDevicesProvider
-                ref.read(connectedDevicesProvider.notifier).update((state) {
-                  final newState = Map<String, DeviceConnectionInfo>.from(
-                    state,
-                  );
-                  newState.remove(senderIp);
-                  return newState;
-                });
-                print("Disconnected from $senderIp");
-                print(
-                  "connectedDevicesMap after disconnect: ${connectedDevicesMap.keys.join(", ")}",
-                );
+                controller.onDisconnect(senderIp);
               };
 
               // 5. onDevicesUpdated
               udpService.onDevicesUpdated =
                   (Map<String, DeviceConnectionInfo> ipDeviceMap) {
-                    print("Devices updated: ${ipDeviceMap.keys.join(", ")}");
-                    ref.read(availableDevicesProvider.notifier).state =
-                        Map<String, DeviceConnectionInfo>.from(ipDeviceMap);
-                    if (ipDeviceMap.isNotEmpty) {
-                      ref.read(isDiscoveredProvider.notifier).state = true;
-                    }
+                    debugPrint("Devices updated: ${ipDeviceMap.keys.join(", ")}");
+                    controller.onDevicesUpdated(ipDeviceMap);
                   };
 
               return Column(
@@ -173,20 +167,20 @@ class _DeviceDiscoveryAndConnectionWidgetState
                                   deviceIp: deviceIp,
                                   context: context,
                                   ref: ref,
-                                  connectionManagerAsync:
-                                      connectionManagerAsync,
+                                  connectionSignalerAsync:
+                                      connectionSignalerAsync,
                                 );
                                 return;
                               }
                               // send connection request
-                              connectionManagerAsync.whenData((
-                                connectionManager,
+                              connectionSignalerAsync.whenData((
+                                signaler,
                               ) {
-                                connectionManager.sendConnectionRequest(
+                                signaler.sendConnectionRequest(
                                   deviceIp,
                                 );
                               });
-                              print("Sent connection request to $deviceIp");
+                              debugPrint("Sent connection request to $deviceIp");
                             },
                             leading: Icon(
                               getPlatformIcon(platform: deviceInfo.platform),
@@ -207,7 +201,7 @@ class _DeviceDiscoveryAndConnectionWidgetState
 
                   StartDiscoveryButton(
                     isDiscovering: isDiscovering,
-                    udpService: udpService,
+                    controller: controller,
                   ),
                 ],
               );
@@ -225,13 +219,12 @@ class _DeviceDiscoveryAndConnectionWidgetState
 
 class StartDiscoveryButton extends ConsumerWidget {
   final bool isDiscovering;
-
-  final UdpDiscoveryService udpService;
+  final DiscoveryController controller;
 
   const StartDiscoveryButton({
     super.key,
     required this.isDiscovering,
-    required this.udpService,
+    required this.controller,
   });
 
   @override
@@ -239,13 +232,11 @@ class StartDiscoveryButton extends ConsumerWidget {
     return TextButton(
       onPressed: () async {
         if (isDiscovering) {
-          udpService.stopBroadcast();
-          ref.read(isDiscoveringProvider.notifier).state = false;
+          await controller.stopDiscovery();
         } else {
           ref.read(availableDevicesProvider.notifier).state = {};
           ref.read(isDiscoveredProvider.notifier).state = false;
-          await udpService.start();
-          ref.read(isDiscoveringProvider.notifier).state = true;
+          await controller.startDiscovery();
         }
       },
       child: Text(isDiscovering ? "Stop Discovery" : "Start Discovery"),
@@ -258,7 +249,7 @@ void showOnConnectionRequestDialog({
   required String senderIp,
   required WidgetRef ref,
   required UdpDiscoveryService udpService,
-  required AsyncValue<ConnectionManager> connectionManagerAsync,
+  required AsyncValue<UdpConnectionSignaler> connectionSignalerAsync,
 }) {
   showDialog(
     context: context,
@@ -279,26 +270,65 @@ void showOnConnectionRequestDialog({
           TextButton(
             onPressed: () {
               // Deny connection
-              connectionManagerAsync.whenData((connectionManager) {
-                connectionManager.sendConnectionDenied(senderIp);
+              connectionSignalerAsync.whenData((signaler) {
+                signaler.sendConnectionDenied(senderIp);
               });
               Navigator.of(context).pop();
             },
             child: const Text("Deny"),
           ),
           TextButton(
-            onPressed: () {
+            onPressed: () async {
               // Accept connection
-              connectionManagerAsync.whenData((connectionManager) {
-                connectionManager.sendConnectionAccepted(senderIp);
+              connectionSignalerAsync.whenData((signaler) {
+                signaler.sendConnectionAccepted(senderIp);
               });
-              print("Accepted connection from $senderIp");
+              debugPrint("Accepted connection from $senderIp");
               // add device to connectedDevicesProvider
               ref.read(connectedDevicesProvider.notifier).update((state) {
                 final newState = Map<String, DeviceConnectionInfo>.from(state);
                 newState[deviceInfo.ip] = deviceInfo;
                 return newState;
               });
+
+              // Initiate TCP connection to the accepted device
+              final tempDeviceId = '${deviceInfo.ip}:${BaseTcpConfig.tcpPort}';
+              try {
+                final connectionManager = await ref.read(connectionManagerProvider.future);
+                final deviceSession = await connectionManager.addDevice(
+                  deviceId: tempDeviceId,
+                  name: deviceInfo.name,
+                  ip: deviceInfo.ip,
+                  port: BaseTcpConfig.tcpPort,
+                  identity: ref.read(deviceIdentityProvider),
+                );
+
+                // Wait for handshake to complete and get fingerprint
+                final fingerprint = await _waitForFingerprint(deviceSession);
+                if (fingerprint != null && context.mounted) {
+                  final verified = await showFingerprintVerificationDialog(
+                    context: context,
+                    deviceName: deviceInfo.name,
+                    fingerprint: fingerprint,
+                  );
+                  
+                  if (!verified) {
+                    // User rejected - disconnect
+                    await deviceSession.close();
+                    ref.read(connectedDevicesProvider.notifier).update((state) {
+                      final newState = Map<String, DeviceConnectionInfo>.from(state);
+                      newState.remove(deviceInfo.ip);
+                      return newState;
+                    });
+                    debugPrint('Connection rejected due to fingerprint mismatch');
+                    return;
+                  }
+                }
+
+                debugPrint('TCP connection initiated to $senderIp');
+              } catch (e) {
+                debugPrint('Failed to initiate TCP connection: $e');
+              }
 
               Navigator.of(context).pop();
             },
@@ -315,7 +345,7 @@ void showOnConnectionAcceptedDialog({
   required String senderIp,
   required WidgetRef ref,
   required UdpDiscoveryService udpService,
-  required AsyncValue<ConnectionManager> connectionManagerAsync,
+  required AsyncValue<UdpConnectionSignaler> connectionSignalerAsync,
 }) {
   showDialog(
     context: context,
@@ -335,7 +365,7 @@ void showOnConnectionAcceptedDialog({
         actions: [
           TextButton(
             onPressed: () {
-              print("Connection accepted from $senderIp");
+              debugPrint("Connection accepted from $senderIp");
               // add device to connectedDevicesProvider
               ref.read(connectedDevicesProvider.notifier).update((state) {
                 final newState = Map<String, DeviceConnectionInfo>.from(state);
@@ -408,7 +438,7 @@ void confirmAndSendDisconnectToDevice({
   required BuildContext context,
   required WidgetRef ref,
   required String deviceIp,
-  required AsyncValue<ConnectionManager> connectionManagerAsync,
+  required AsyncValue<UdpConnectionSignaler> connectionSignalerAsync,
 }) {
   showDialog(
     context: context,
@@ -428,8 +458,8 @@ void confirmAndSendDisconnectToDevice({
           TextButton(
             onPressed: () {
               // send disconnect message
-              connectionManagerAsync.whenData((connectionManager) {
-                connectionManager.sendDisconnect(deviceIp);
+              connectionSignalerAsync.whenData((signaler) {
+                signaler.sendDisconnect(deviceIp);
               });
               // remove device from connectedDevicesProvider
               ref.read(connectedDevicesProvider.notifier).update((state) {
@@ -438,7 +468,7 @@ void confirmAndSendDisconnectToDevice({
                 return newState;
               });
 
-              print(
+              debugPrint(
                 "connected devices after disconnect: ${ref.read(connectedDevicesProvider).keys.join(", ")}",
               );
               Navigator.of(context).pop();
@@ -466,4 +496,108 @@ IconData getPlatformIcon({required String platform}) {
     default:
       return Icons.devices;
   }
+}
+
+Future<String?> _waitForFingerprint(DeviceSession deviceSession) async {
+  // Wait for handshake to complete and fingerprint to be available
+  // Listen for the fingerprint stream with a timeout
+  final completer = Completer<String?>();
+  late StreamSubscription<SimplePublicKey> subscription;
+  
+  subscription = deviceSession.onPeerFingerprintKnown.listen((peerKey) {
+    final fingerprint = _computeFingerprint(peerKey);
+    if (!completer.isCompleted) {
+      completer.complete(fingerprint);
+    }
+  });
+  
+  // Timeout after 30 seconds
+  Future.delayed(const Duration(seconds: 30), () {
+    if (!completer.isCompleted) {
+      completer.complete(null);
+    }
+  });
+  
+  try {
+    return await completer.future;
+  } finally {
+    await subscription.cancel();
+  }
+}
+
+Future<bool> showFingerprintVerificationDialog({
+  required BuildContext context,
+  required String deviceName,
+  required String fingerprint,
+}) async {
+  final formattedFingerprint = _formatFingerprint(fingerprint);
+  
+  return await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (context) => AlertDialog(
+      title: const Text('Verify Device Identity'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Device: $deviceName'),
+          const SizedBox(height: 8),
+          const Text('Please verify the fingerprint matches on both devices:'),
+          const SizedBox(height: 12),
+          SelectableText(
+            _formatFingerprintForDisplay(fingerprint),
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 14,
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            'If the fingerprints match on both devices, tap "Verify". '
+            'If they do not match, tap "Reject" - this could indicate a man-in-the-middle attack.',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Reject'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('Verify'),
+        ),
+      ],
+    ),
+  ) ?? false;
+}
+
+String _computeFingerprint(SimplePublicKey key) {
+  final digest = sha256.convert(key.bytes);
+  return base64Encode(digest.bytes);
+}
+
+String _formatFingerprint(String fingerprint) {
+  // Add colons every 2 characters for readability
+  final buffer = StringBuffer();
+  for (int i = 0; i < fingerprint.length; i += 2) {
+    if (i > 0) buffer.write(':');
+    buffer.write(fingerprint.substring(i, i + 2));
+  }
+  return buffer.toString();
+}
+
+String _formatFingerprintForDisplay(String fingerprint) {
+  // Format with line breaks every 8 groups for readability
+  final groups = <String>[];
+  for (int i = 0; i < fingerprint.length; i += 2) {
+    groups.add(fingerprint.substring(i, i + 2));
+  }
+  final lines = <String>[];
+  for (int i = 0; i < groups.length; i += 8) {
+    lines.add(groups.sublist(i, (i + 8).clamp(0, groups.length)).join(':'));
+  }
+  return lines.join('\n');
 }

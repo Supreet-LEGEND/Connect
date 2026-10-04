@@ -1,7 +1,6 @@
 import 'package:permission_handler/permission_handler.dart';
 import 'package:geolocator/geolocator.dart';
 
-/// A flexible reusable permission manager
 class PermissionManager {
   // Request a single permission
   static Future<PermissionStatus> requestPermission(
@@ -19,7 +18,6 @@ class PermissionManager {
     if (status.isPermanentlyDenied) {
       await openAppSettings();
     }
-
     return status;
   }
 
@@ -76,7 +74,6 @@ class PermissionManager {
   }
 
   /// Ensures both LOCATION permission + GPS enabled.
-  /// This is the one you will use for WiFi scanning.
   static Future<bool> ensureLocationReady() async {
     // Step 1: Request Location Permission
     final hasPermission = await ensure(Permission.location);
