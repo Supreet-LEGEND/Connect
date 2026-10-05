@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/legacy.dart';
 
 /// Centralized app theme definitions and a Riverpod notifier to manage ThemeMode.
 ///
