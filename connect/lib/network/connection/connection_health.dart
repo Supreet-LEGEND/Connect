@@ -9,6 +9,7 @@ abstract class HeartbeatCapable {
 
 enum ConnectionState {
   connected,
+  pendingVerification,
   reconnecting,
   disconnected,
 }
@@ -28,6 +29,13 @@ class ConnectionHealth {
   Stream<ConnectionState> get stateChanges => _stateController.stream;
 
   ConnectionState get currentState => _state;
+
+  void setState(ConnectionState state) {
+    if (_state != state) {
+      _state = state;
+      _stateController.add(_state);
+    }
+  }
 
   ConnectionHealth({
     this.heartbeatInterval = const Duration(seconds: 5),

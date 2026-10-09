@@ -119,7 +119,7 @@ class TrustStore {
   /// Load trust store from disk
   Future<void> load() async {
     try {
-      final directory = await getApplicationDocumentsDirectory();
+      final directory = await getApplicationSupportDirectory();
       final file = File('${directory.path}/trust_store.json');
       if (await file.exists()) {
         final jsonStr = await file.readAsString();
@@ -136,7 +136,7 @@ class TrustStore {
   }
 
   Future<void> _persist() async {
-    final directory = await getApplicationDocumentsDirectory();
+    final directory = await getApplicationSupportDirectory();
     final file = File('${directory.path}/trust_store.json');
     // Atomic write
     final tempFile = File('${file.path}.tmp');
@@ -150,5 +150,24 @@ class TrustStore {
 
   void dispose() {
     _onPeerTrusted.close();
+  }
+
+  /// Convert TrustStore to JSON string
+  String toJson() {
+    final data = <String, dynamic>{};
+    for (final entry in _trustedPeers.entries) {
+      data[entry.key] = entry.value.toJson();
+    }
+    return jsonEncode(data);
+  }
+
+  /// Create TrustStore from JSON string
+  factory TrustStore.fromJson(String json) {
+    final store = TrustStore();
+    final data = jsonDecode(json) as Map<String, dynamic>;
+    for (final entry in data.entries) {
+      store._trustedPeers[entry.key] = TrustEntry.fromJson(entry.value as Map<String, dynamic>);
+    }
+    return store;
   }
 }

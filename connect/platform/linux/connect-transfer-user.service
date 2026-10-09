@@ -1,0 +1,45 @@
+[Unit]
+Description=Connect Background Transfer Service (User)
+Documentation=https://github.com/connect/connect
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/connect-background-transfer
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/ConnectTransfers %h/.local/share/connect
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Environment
+Environment=RUST_LOG=info
+Environment=CONNECT_DATA_DIR=%h/.local/share/connect
+Environment=CONNECT_TRANSFER_DIR=%h/ConnectTransfers
+Environment=DISPLAY=:0
+
+# Standard output/error to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=connect-transfer-user
+
+[Install]
+WantedBy=default.target

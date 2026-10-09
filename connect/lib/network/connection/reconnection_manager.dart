@@ -30,6 +30,7 @@ class ReconnectionManager {
   final Duration initialDelay;
   final Duration maxDelay;
   final double backoffMultiplier;
+  final Duration? maxTotalDuration;
 
   final StreamController<ReconnectionEvent> _eventController =
       StreamController<ReconnectionEvent>.broadcast();
@@ -41,12 +42,14 @@ class ReconnectionManager {
     this.initialDelay = const Duration(seconds: 1),
     this.maxDelay = const Duration(seconds: 30),
     this.backoffMultiplier = 2.0,
+    this.maxTotalDuration,
   });
 
   Future<bool> reconnect({
     required DeviceSession session,
     required void Function() onBeforeConnect,
     required void Function() onAfterConnect,
+    void Function()? onExhausted,
   }) async {
     _emitEvent(ReconnectionEvent(
       type: ReconnectionEventType.started,
@@ -54,7 +57,25 @@ class ReconnectionManager {
       delay: Duration.zero,
     ));
 
+    final startTime = DateTime.now();
+    Duration totalElapsed = Duration.zero;
+
     for (int attempt = 0; attempt < maxRetries; attempt++) {
+      // Check total duration limit
+      if (maxTotalDuration != null) {
+        totalElapsed = DateTime.now().difference(startTime);
+        if (totalElapsed >= maxTotalDuration!) {
+          _emitEvent(ReconnectionEvent(
+            type: ReconnectionEventType.exhausted,
+            attempt: attempt,
+            delay: totalElapsed,
+            error: Exception('Max total reconnection time exceeded'),
+          ));
+          onExhausted?.call();
+          return false;
+        }
+      }
+
       final delay = _calculateBackoff(attempt);
 
       _emitEvent(ReconnectionEvent(
@@ -64,6 +85,21 @@ class ReconnectionManager {
       ));
 
       await Future.delayed(delay);
+
+      // Check total duration again after delay
+      if (maxTotalDuration != null) {
+        totalElapsed = DateTime.now().difference(startTime);
+        if (totalElapsed >= maxTotalDuration!) {
+          _emitEvent(ReconnectionEvent(
+            type: ReconnectionEventType.exhausted,
+            attempt: attempt + 1,
+            delay: totalElapsed,
+            error: Exception('Max total reconnection time exceeded'),
+          ));
+          onExhausted?.call();
+          return false;
+        }
+      }
 
       try {
         onBeforeConnect();
@@ -92,7 +128,8 @@ class ReconnectionManager {
       attempt: maxRetries,
       delay: _calculateBackoff(maxRetries - 1),
     ));
-
+    
+    onExhausted?.call();
     return false;
   }
 

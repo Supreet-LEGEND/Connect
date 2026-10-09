@@ -1,5 +1,6 @@
 import 'package:connect/view/widgets/device_discovery_and_connection_widget.dart';
 import 'package:connect/view/widgets/wifi_connection_widgets.dart';
+import 'package:connect/view/widgets/app_end_drawer.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -22,9 +23,20 @@ class _HomePageState extends ConsumerState<HomePage> {
             color: Theme.of(context).colorScheme.onSurface,
           ),
         ),
-
         centerTitle: true,
+        actions: [
+          Builder(
+            builder: (context) => IconButton(
+              icon: const Icon(Icons.menu),
+              tooltip: 'Menu',
+              onPressed: () {
+                Scaffold.of(context).openEndDrawer();
+              },
+            ),
+          ),
+        ],
       ),
+      endDrawer: const AppEndDrawer(),
       body: Container(
         padding: EdgeInsets.all(16),
         child: Column(

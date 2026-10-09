@@ -24,6 +24,13 @@ class DeviceSession {
 
   bool _isReconnecting = false;
   StreamSubscription? _healthSubscription;
+  
+  // Callback when reconnection is exhausted - set by ConnectionManager
+  void Function()? onReconnectionExhausted;
+  
+  // Verification support
+  final Completer<bool> _verificationCompleter = Completer<bool>();
+  bool _verificationCompleted = false;
 
   DeviceSession({
     required String deviceId,
@@ -54,6 +61,7 @@ class DeviceSession {
           initialDelay: const Duration(seconds: 1),
           maxDelay: const Duration(seconds: 30),
           backoffMultiplier: 2.0,
+          maxTotalDuration: const Duration(minutes: 2), // 2 minutes max total
         );
 
   String get deviceId => _deviceId;
@@ -65,7 +73,8 @@ class DeviceSession {
 
   Stream<ReconnectionEvent> get reconnectionEvents => reconnectionManager.events;
 
-  Future<void> connect() async {
+  /// Connect and perform handshake, but wait for verification before marking as fully connected
+  Future<void> connect({bool requireVerification = false}) async {
     await pool.connect();
     await pool.performHandshakes(isInitiator: true);
 
@@ -81,6 +90,29 @@ class DeviceSession {
       if (peerKey != null) {
         _peerFingerprintController.add(peerKey);
       }
+    }
+
+    if (requireVerification) {
+      // Set health state to pending verification
+      health.setState(ConnectionState.pendingVerification);
+      // Wait for verification result
+      final verified = await _verificationCompleter.future;
+      if (!verified) {
+        // Verification rejected - close all connections
+        await pool.close();
+        health.setState(ConnectionState.disconnected);
+        throw StateError('Connection rejected by user');
+      }
+      // Verification passed - mark as connected
+      health.setState(ConnectionState.connected);
+    }
+  }
+
+  /// Complete the verification process
+  void completeVerification(bool verified) {
+    if (!_verificationCompleted) {
+      _verificationCompleted = true;
+      _verificationCompleter.complete(verified);
     }
   }
 
@@ -119,6 +151,10 @@ class DeviceSession {
           if (pool.connections.isNotEmpty) {
             _setupHealthMonitoring(pool.connections.first);
           }
+        },
+        onExhausted: () {
+          // Notify ConnectionManager to clean up this device
+          onReconnectionExhausted?.call();
         },
       );
     } finally {

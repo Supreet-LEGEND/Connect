@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.connect.background-transfer</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/connect-background-transfer</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/var/log/connect-background-transfer.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/connect-background-transfer.error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>CONNECT_DATA_DIR</key>
+        <string>/var/lib/connect</string>
+        <key>CONNECT_TRANSFER_DIR</key>
+        <string>/Users/Shared/ConnectTransfers</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>

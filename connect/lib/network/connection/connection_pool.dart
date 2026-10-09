@@ -73,14 +73,23 @@ class ConnectionPool {
   }
 
   Connection? getFreeConnection() {
-    for (final connection in _connections) {
+    for (int i = 0; i < _connections.length; i++) {
+      final connection = _connections[i];
       if (!connection.isBusy &&
           connection.isConnected &&
-          connection.isHandshakeComplete) {
+          connection.isHandshakeComplete &&
+          isConnectionHealthy(i)) {
         return connection;
       }
     }
     return null;
+  }
+
+  /// Check if a connection at the given index is healthy
+  bool isConnectionHealthy(int index) {
+    if (index < 0 || index >= _connections.length) return false;
+    final connection = _connections[index];
+    return connection.isConnected && connection.isHandshakeComplete;
   }
 
   void updateDeviceId(String newDeviceId) {

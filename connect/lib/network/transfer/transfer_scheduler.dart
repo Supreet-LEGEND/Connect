@@ -401,10 +401,20 @@ class TransferScheduler {
     final now = DateTime.now();
     for (final chunk in _allChunks.values) {
       if (chunk.state == ChunkState.sending && chunk.sentAt != null && now.difference(chunk.sentAt!) > config.chunkTimeout) {
-        chunk.state = ChunkState.queued;
-        _connectionQueues[chunk.connectionIndex].add(chunk);
-        stats.totalRetries++;
-        _emitEvent(ChunkRetryEvent(chunk.id, chunk.retryCount + 1, Duration.zero));
+        // Check if the connection is still healthy before re-queuing
+        if (pool.isConnectionHealthy(chunk.connectionIndex)) {
+          chunk.state = ChunkState.queued;
+          _connectionQueues[chunk.connectionIndex].add(chunk);
+          stats.totalRetries++;
+          _emitEvent(ChunkRetryEvent(chunk.id, chunk.retryCount + 1, Duration.zero));
+        } else {
+          // Connection is unhealthy, mark chunk as failed to trigger retry on another connection
+          // or let the worker handle it when it tries to send
+          chunk.state = ChunkState.queued;
+          // Don't re-queue on this connection, let the worker pick a healthy one
+          stats.totalRetries++;
+          _emitEvent(ChunkRetryEvent(chunk.id, chunk.retryCount + 1, Duration.zero));
+        }
       }
     }
   }

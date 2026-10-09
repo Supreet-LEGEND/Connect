@@ -1,0 +1,21 @@
+[package]
+name = "connect-background-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+windows-service = { version = "0.5", features = ["async"] }
+windows = { version = "0.56", features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"

@@ -31,6 +31,7 @@ class ConnectionManager {
     required int port,
     required DeviceIdentity identity,
     int sockets = 4,
+    Future<bool> Function(String fingerprint)? onVerifyFingerprint,
   }) async {
     final existing =
         _devices[deviceId];
@@ -50,7 +51,13 @@ class ConnectionManager {
       sockets: sockets,
     );
 
-    await device.connect();
+    // Set callback for when reconnection is exhausted
+    device.onReconnectionExhausted = () {
+      remove(deviceId);
+    };
+
+    // Connect with verification if callback provided
+    await device.connect(requireVerification: onVerifyFingerprint != null);
 
     _devices[deviceId] = device;
 
@@ -62,6 +69,13 @@ class ConnectionManager {
       }
       // Update trust entry in peer registry after handshake
       _updatePeerTrustEntry(fingerprint);
+      
+      // If verification callback provided, call it
+      if (onVerifyFingerprint != null) {
+        onVerifyFingerprint(fingerprint).then((verified) {
+          device.completeVerification(verified);
+        });
+      }
     });
 
     // Register/update peer in registry

@@ -72,6 +72,9 @@ abstract class Transfer {
 
   /// Check if transfer is paused
   bool get isPaused => status == TransferStatus.paused;
+
+  /// Progress as a percentage (0.0 to 1.0)
+  double get progress => 0.0;
 }
 
 /// Outgoing file transfer (send to device)
@@ -106,6 +109,7 @@ class FileTransfer extends Transfer {
   });
 
   /// Progress as a percentage (0.0 to 1.0)
+  @override
   double get progress {
     if (totalBytes == 0) {
       return 1.0;
@@ -142,6 +146,9 @@ class ReceivingFileTransfer extends Transfer {
   /// Total file size
   final int fileSize;
 
+  /// Total number of chunks (from sender's file_start)
+  int totalChunks = 0;
+
   /// RandomAccessFile for writing received data
   final RandomAccessFile file;
 
@@ -162,11 +169,16 @@ class ReceivingFileTransfer extends Transfer {
   });
 
   /// Progress as a percentage (0.0 to 1.0)
+  @override
   double get progress {
     if (fileSize == 0) {
       return 1.0;
     }
-    return receivedChunks.length / (fileSize ~/ (1024 * 1024) + 1);
+    if (totalChunks == 0) {
+      // Fallback: estimate based on 1MB chunks
+      return receivedChunks.length / (fileSize ~/ (1024 * 1024) + 1);
+    }
+    return receivedChunks.length / totalChunks;
   }
 
   @override

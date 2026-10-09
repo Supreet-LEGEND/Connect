@@ -88,7 +88,7 @@ class TransferProgress {
   static Future<TransferProgress?> load(Database db, String transferId) async {
     final maps = await db.query('transfers', where: 'id = ?', whereArgs: [transferId], limit: 1);
     if (maps.isEmpty) return null;
-    return _mapToProgress(maps.first);
+    return _mapToProgress(maps.first, db);
   }
 
   // Delete progress file (on completion)
@@ -100,7 +100,11 @@ class TransferProgress {
   // List all incomplete transfers
   static Future<List<TransferProgress>> listIncomplete(Database db) async {
     final maps = await db.query('transfers', where: "status IN ('transferring', 'queued')");
-    return maps.map(_mapToProgress).toList();
+    final results = <TransferProgress>[];
+    for (final map in maps) {
+      results.add(await _mapToProgress(map, db));
+    }
+    return results;
   }
 
   // Check if chunk is already completed
@@ -131,16 +135,24 @@ class TransferProgress {
     return calculatedHash == fileHash;
   }
 
-  static TransferProgress _mapToProgress(Map<String, dynamic> map) {
+  static Future<TransferProgress> _mapToProgress(Map<String, dynamic> map, Database db) async {
     final totalChunks = map['total_chunks'] as int;
-    final completedCount = (map['completed_chunks'] as int?) ?? 0;
+    final transferId = map['id'] as String;
+    
+    // Load actual completed chunk indices from chunks table
     final completedChunks = <int>{};
-    for (int i = 0; i < completedCount && i < totalChunks; i++) {
-      completedChunks.add(i);
+    final chunkMaps = await db.query('chunks', 
+      where: 'transfer_id = ? AND status = ?', 
+      whereArgs: [transferId, 'acked']);
+    for (final chunkMap in chunkMaps) {
+      final chunkIndex = chunkMap['chunk_index'] as int;
+      if (chunkIndex < totalChunks) {
+        completedChunks.add(chunkIndex);
+      }
     }
     
     return TransferProgress(
-      transferId: map['id'] as String,
+      transferId: transferId,
       deviceId: map['device_id'] as String,
       fileName: map['file_name'] as String,
       filePath: map['file_path'] as String,

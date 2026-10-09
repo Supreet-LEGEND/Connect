@@ -4,14 +4,32 @@ import 'package:connect/relay/permission_manager.dart';
 import 'package:connect/relay/providers/connection_permission_providers.dart';
 import 'package:connect/relay/providers/hotspot_status_provider.dart';
 import 'package:connect/relay/providers/lifecycle_state_provider.dart';
+import 'package:connect/relay/providers/settings_provider.dart';
 import 'package:connect/relay/providers/transfer_providers.dart';
 import 'package:connect/relay/providers/wifi_status_provider.dart';
+import 'package:connect/view/about_page.dart';
 import 'package:connect/view/home_page.dart';
+import 'package:connect/view/settings_page.dart';
+import 'package:connect/view/transfer_page.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:connect/view/theme/app_theme.dart';
+import 'package:connect/network/storage/database_helper_factory.dart';
+import 'dart:io' show Platform;
 
+// Initialize sqflite FFI for Windows/Linux/macOS (required for database access)
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 void main() {
+  // Initialize sqflite FFI for Windows/Linux/macOS (required for database access)
+  if (!Platform.isAndroid && !Platform.isIOS) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  }
+  
+  // Initialize platform-specific database helper
+  initializeDatabaseHelper();
+  
   runApp(ProviderScope(child: const App()));
 }
 
@@ -26,19 +44,21 @@ class _AppState extends ConsumerState<App> {
   @override
   void initState() {
     super.initState();
-    // Initialize device identity in background, then start TCP server
+    // Initialize device identity in background, then start transfer controller (which starts TCP server in network isolate)
     _initializeDeviceIdentityAndServer();
+    // Ensure permissions for wifi scan are ready
+    PermissionManager.ensureWifiScanReady();
   }
 
   Future<void> _initializeDeviceIdentityAndServer() async {
     try {
       await ref.read(deviceIdentityFutureProvider.future);
       debugPrint('Device identity initialized');
-      // Start TCP server
-      await ref.read(tcpServerProvider.future);
-      debugPrint('TCP server started on port ${BaseTcpConfig.tcpPort}');
+      // Start transfer controller (which initializes network isolate with TCP server)
+      await ref.read(transferControllerProvider.future);
+      debugPrint('Transfer controller initialized, TCP server started on port ${BaseTcpConfig.tcpPort}');
     } catch (e) {
-      debugPrint('Failed to initialize device identity or TCP server: $e');
+      debugPrint('Failed to initialize device identity or transfer controller: $e');
     }
   }
 
@@ -50,8 +70,8 @@ class _AppState extends ConsumerState<App> {
 
   @override
   Widget build(BuildContext context) {
-    // ensure permissions for wifi scan are ready
-    PermissionManager.ensureWifiScanReady();
+    // Watch theme mode from settings
+    final themeMode = ref.watch(themeModeProvider);
 
     return AppLifecycleHandler(
       onStateChanged: (state) {
@@ -79,10 +99,15 @@ class _AppState extends ConsumerState<App> {
       },
       child: MaterialApp(
         title: 'Connect App',
-        themeMode: ThemeMode.dark,
-        darkTheme: ThemeData.dark(),
-        theme: ThemeData(primarySwatch: Colors.purple),
-        routes: {'/': (context) => HomePage()},
+        themeMode: themeMode,
+        theme: AppTheme.lightTheme,
+        darkTheme: AppTheme.darkTheme,
+        routes: {
+          '/': (context) => const HomePage(),
+          '/transfers': (context) => const TransferPage(),
+          '/settings': (context) => const SettingsPage(),
+          '/about': (context) => const AboutPage(),
+        },
       ),
     );
   }

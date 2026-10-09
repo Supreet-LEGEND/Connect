@@ -1,9 +1,11 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:connect/network/connection_utils/device_communication_msg_utils.dart';
 import 'package:connect/network/connection_utils/device_connection_data_utils.dart';
 import 'package:connect/core/device_discovery_and_connection/udp_msg.dart';
+import 'package:connect/core/hardware_connection_status/hardware_connection_status_manager.dart';
 
 class UdpDiscoveryService {
   final String myIp;
@@ -21,11 +23,16 @@ class UdpDiscoveryService {
   RawDatagramSocket? _socket;
   Timer? _broadcastTimer;
   Timer? _cleanupTimer;
+  Timer? _networkCheckTimer;
+  String? _lastKnownIp;
 
   final List<DeviceConnectionInfo> devices = [];
   final Map<String, DeviceConnectionInfo> ipDeviceMap = {}; // key: device IP
   final Map<String, DeviceConnectionInfo> connectedDevices =
       {}; // key: device IP
+
+  // Reusable socket for sending connection signals
+  RawDatagramSocket? _signalSocket;
 
   UdpDiscoveryService({
     required this.broadcastPort,
@@ -36,31 +43,58 @@ class UdpDiscoveryService {
     this.onConnectionRequest,
     this.onConnectionAccepted,
     this.onConnectionDenied,
-  });
+  }) {
+    _lastKnownIp = myIp;
+  }
 
   Future<void> start() async {
-    _socket = await RawDatagramSocket.bind(
-      InternetAddress.anyIPv4,
-      broadcastPort,
-    );
+    try {
+      _socket = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        broadcastPort,
+      );
 
-    _socket!.broadcastEnabled = true;
+      _socket!.broadcastEnabled = true;
 
-    _socket!.listen((event) {
-      if (event == RawSocketEvent.read) {
-        _receivePacket();
+      _socket!.listen((event) {
+        if (event == RawSocketEvent.read) {
+          _receivePacket();
+        }
+      }, onError: (error) {
+        debugPrint('UDP socket error: $error');
+      });
+
+      // Initialize signal socket
+      await _initSignalSocket();
+
+      // Send discovery broadcast repeatedly
+      _broadcastTimer = Timer.periodic(Duration(seconds: 3), (_) {
+        _sendBroadcast();
+      });
+
+      // Clean dead/inactive devices
+      _cleanupTimer = Timer.periodic(Duration(seconds: cleanupIntervalSec), (_) {
+        _cleanupDevices();
+      });
+
+      // Check for network changes (IP address changes)
+      _networkCheckTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+        _checkNetworkChange();
+      });
+    } on SocketException catch (e) {
+      debugPrint('Failed to bind UDP socket on port $broadcastPort: $e');
+      // Try fallback port
+      if (broadcastPort != 50001) {
+        debugPrint('Trying fallback port 50001...');
+        // Note: This would require recreating the service with new port
+        // For now, just log the error
       }
-    });
+      rethrow;
+    }
+  }
 
-    // Send discovery broadcast repeatedly
-    _broadcastTimer = Timer.periodic(Duration(seconds: 3), (_) {
-      _sendBroadcast();
-    });
-
-    // Clean dead/inactive devices
-    _cleanupTimer = Timer.periodic(Duration(seconds: cleanupIntervalSec), (_) {
-      _cleanupDevices();
-    });
+  Future<void> _initSignalSocket() async {
+    _signalSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
   }
 
   // ---------------------- SEND BROADCAST --------------------------
@@ -123,9 +157,6 @@ class UdpDiscoveryService {
   // ---------------------- CLEANUP --------------------------
   void _cleanupDevices() {
     final now = DateTime.now();
-    // devices.removeWhere(
-    //   (device) => now.difference(device.lastSeen).inSeconds > deviceTimeoutSec,
-    // );
     ipDeviceMap.removeWhere(
       (ip, device) =>
           now.difference(device.lastSeen).inSeconds > deviceTimeoutSec,
@@ -136,17 +167,65 @@ class UdpDiscoveryService {
     onDevicesUpdated?.call(Map<String, DeviceConnectionInfo>.from(ipDeviceMap));
   }
 
+  Future<void> _checkNetworkChange() async {
+    final currentIp = await WifiConnectionManager.getLocalIp();
+    if (currentIp != null && currentIp != _lastKnownIp) {
+      _lastKnownIp = currentIp;
+      // Rebind sockets with new IP
+      await _rebindSockets(currentIp);
+    }
+  }
+
+  Future<void> _rebindSockets(String newIp) async {
+    // Close and rebind broadcast socket
+    _broadcastTimer?.cancel();
+    _socket?.close();
+    _signalSocket?.close();
+    
+    // Wait for OS to release ports
+    await Future.delayed(const Duration(milliseconds: 100));
+    
+    _socket = await RawDatagramSocket.bind(
+      InternetAddress.anyIPv4,
+      broadcastPort,
+      reuseAddress: true,
+    );
+    _socket!.broadcastEnabled = true;
+    _socket!.listen((event) {
+      if (event == RawSocketEvent.read) {
+        _receivePacket();
+      }
+    });
+    
+    _broadcastTimer = Timer.periodic(Duration(seconds: 3), (_) {
+      _sendBroadcast();
+    });
+
+    // Rebind signal socket
+    await _initSignalSocket();
+  }
+
   void stopBroadcast() {
     _broadcastTimer?.cancel();
     _cleanupTimer?.cancel();
+    _networkCheckTimer?.cancel();
   }
 
   void closeSockets() {
     _socket?.close();
+    _signalSocket?.close();
   }
 
   void dispose() {
     stopBroadcast();
     closeSockets();
+  }
+
+  // Getter for signal socket (lazy initialization)
+  Future<RawDatagramSocket> get signalSocket async {
+    if (_signalSocket == null) {
+      await _initSignalSocket();
+    }
+    return _signalSocket!;
   }
 }

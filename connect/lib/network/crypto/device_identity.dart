@@ -9,8 +9,9 @@ import 'package:path_provider/path_provider.dart';
 
 class DeviceIdentity {
   SimpleKeyPairData? _identityKeyPair;
+  List<int>? _privateKeySeed;
   String? _cachedIdentityKeyJson;
-  final Completer<void> _initCompleter = Completer<void>();
+  Completer<void>? _initCompleter;
 
   SimplePublicKey get identityPublicKey {
     final keyPair = _identityKeyPair;
@@ -36,29 +37,57 @@ class DeviceIdentity {
     return base64Encode(digest.bytes);
   }
 
+  String get privateKeyPem {
+    final seed = _privateKeySeed;
+    if (seed == null) {
+      throw StateError('Identity key not initialized. Call initialize() first.');
+    }
+    return base64Encode(seed);
+  }
+
+  /// Create DeviceIdentity from PEM-encoded private key (base64 encoded seed)
+  static Future<DeviceIdentity> createFromPrivateKeyPem(String pem) async {
+    final identity = DeviceIdentity._internal();
+    final seedBytes = base64Decode(pem);
+    final ed25519 = Ed25519();
+    identity._identityKeyPair = (await ed25519.newKeyPairFromSeed(seedBytes)) as SimpleKeyPairData;
+    identity._privateKeySeed = seedBytes;
+    identity._initCompleter?.complete();
+    return identity;
+  }
+
+  DeviceIdentity._internal() {
+    _initCompleter = Completer<void>();
+  }
+
+  DeviceIdentity() {
+    _initCompleter = Completer<void>();
+  }
+
   Future<void> initialize() async {
-    if (_initCompleter.isCompleted) {
-      return _initCompleter.future;
+    if (_initCompleter!.isCompleted) {
+      return _initCompleter!.future;
     }
 
     try {
       if (await _loadKeyPair()) {
-        _initCompleter.complete();
+        _initCompleter!.complete();
         return;
       }
 
       final ed25519 = Ed25519();
       final seed = List<int>.generate(32, (_) => Random.secure().nextInt(256));
       _identityKeyPair = (await ed25519.newKeyPairFromSeed(seed)) as SimpleKeyPairData;
+      _privateKeySeed = seed;
 
       _cachedIdentityKeyJson = jsonEncode({
         'seed': base64Encode(seed),
         'publicKey': base64Encode(_identityKeyPair!.publicKey.bytes),
       });
       await _persistKeyPair();
-      _initCompleter.complete();
+      _initCompleter!.complete();
     } catch (e) {
-      _initCompleter.completeError(e);
+      _initCompleter!.completeError(e);
       rethrow;
     }
   }
@@ -98,7 +127,7 @@ class DeviceIdentity {
   }
 
   Future<void> _persistKeyPair() async {
-    final directory = await getApplicationDocumentsDirectory();
+    final directory = await getApplicationSupportDirectory();
     final file = File('${directory.path}/device_identity.json');
     // Atomic write: write to temp file then rename
     final tempFile = File('${file.path}.tmp');
@@ -108,7 +137,7 @@ class DeviceIdentity {
 
   Future<bool> _loadKeyPair() async {
     try {
-      final directory = await getApplicationDocumentsDirectory();
+      final directory = await getApplicationSupportDirectory();
       final file = File('${directory.path}/device_identity.json');
       if (!await file.exists()) {
         return false;
@@ -125,6 +154,7 @@ class DeviceIdentity {
 
       final ed25519 = Ed25519();
       _identityKeyPair = (await ed25519.newKeyPairFromSeed(seedBytes)) as SimpleKeyPairData;
+      _privateKeySeed = seedBytes;
 
       // Validate the public key matches what we stored
       if (!const ListEquality().equals(_identityKeyPair!.publicKey.bytes, storedPublicKeyBytes)) {

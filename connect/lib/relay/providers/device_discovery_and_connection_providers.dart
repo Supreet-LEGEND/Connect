@@ -44,6 +44,8 @@ class DiscoveryController {
   Future<void> startDiscovery() async {
     final service = await ref.read(udpDiscoveryServiceProvider.future);
     if (service != null) {
+      // Restart broadcast if it was stopped
+      service.stopBroadcast();
       await service.start();
       ref.read(isDiscoveringProvider.notifier).state = true;
     }

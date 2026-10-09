@@ -33,10 +33,13 @@ class DefaultUdpBroadcastAndConnectionService {
     String? ip = await WifiConnectionManager.getLocalIp();
     String deviceName = await DeviceDetailsManager().getDeviceName();
 
+    final discoveryService = await getDefaultUdpDiscoveryService();
+
     return UdpConnectionSignaler(
       port: UdpConfig.broadcastPort,
       deviceIp: ip!,
       deviceName: deviceName,
+      discoveryService: discoveryService,
     );
   }
 }

@@ -67,7 +67,7 @@ class PeerRegistry {
 
   Future<void> load() async {
     try {
-      final directory = await getApplicationDocumentsDirectory();
+      final directory = await getApplicationSupportDirectory();
       final file = File('${directory.path}/peers.json');
       if (await file.exists()) {
         final jsonStr = await file.readAsString();
@@ -83,7 +83,7 @@ class PeerRegistry {
   }
 
   Future<void> _persist() async {
-    final directory = await getApplicationDocumentsDirectory();
+    final directory = await getApplicationSupportDirectory();
     final file = File('${directory.path}/peers.json');
     final data = <String, dynamic>{};
     for (final entry in _peers.entries) {
@@ -150,6 +150,8 @@ class PeerRegistry {
     await _persist();
     _onPeersChanged.add(Map.unmodifiable(_peers));
   }
+
+  bool hasPeer(String deviceId) => _peers.containsKey(deviceId);
 
   void dispose() {
     _onPeersChanged.close();

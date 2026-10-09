@@ -21,8 +21,12 @@ dependencies:
   go_router: ^17.0.0
   path: ^1.9.0
   path_provider: ^2.1.1
-  permission_handler: ^12.0.1
+  package_info_plus: ^8.0.0
+  permission_handler: 13.0.2
+  shared_preferences: ^2.3.0
   sqflite: ^2.3.0
+  sqflite_common_ffi: ^2.3.0
+  url_launcher: ^6.2.0
   wifi_connection:
     path: plugins/wifi_connection
   wifi_iot: ^0.3.19+2
